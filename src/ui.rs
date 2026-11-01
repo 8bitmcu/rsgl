@@ -43,6 +43,7 @@ pub fn run(games: Vec<Game>, cfg: UiCfg, api_cfg: ApiCfg, error: Option<String>)
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([520.0, 400.0])
+            .with_maximized(true)
             .with_title("Games")
             .with_app_id("rsgl"),
         ..Default::default()
