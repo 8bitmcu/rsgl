@@ -1,4 +1,8 @@
-use crate::{api, config::{ApiCfg, Game, UiCfg}, launch};
+use crate::{
+    api,
+    config::{ApiCfg, Game, UiCfg},
+    launch,
+};
 use eframe::egui;
 use egui::{vec2, Align, Align2, Color32, FontId, Key, Modifiers, RichText, Stroke};
 use std::{
@@ -108,11 +112,20 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
         }
         None => {
             // colored placeholder derived from the name
-            let hash = g.name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
+            let hash = g
+                .name
+                .bytes()
+                .fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
             let hue = (hash % 360) as f32 / 360.0;
             let fill = Color32::from(egui::ecolor::Hsva::new(hue, 0.45, 0.35, 1.0));
             ui.painter().rect_filled(cover, radius, fill);
-            let initial: String = g.name.chars().next().unwrap_or('?').to_uppercase().collect();
+            let initial: String = g
+                .name
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_uppercase()
+                .collect();
             ui.painter().text(
                 cover.center(),
                 Align2::CENTER_CENTER,
@@ -134,7 +147,11 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
 
     let label_rect =
         egui::Rect::from_min_size(rect.min + vec2(0.0, cover_h + 8.0), vec2(w, LABEL_H - 8.0));
-    let color = if selected { Color32::WHITE } else { Color32::from_gray(170) };
+    let color = if selected {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(170)
+    };
     ui.put(
         label_rect,
         egui::Label::new(RichText::new(&g.name).size(13.0).color(color))
@@ -189,17 +206,30 @@ impl App {
 
 /// Draws the image at `path` scaled to cover `screen` (cropping the overflow),
 /// dimmed and at the given opacity. Draws nothing until the texture is loaded.
-fn paint_cover(ctx: &egui::Context, painter: &egui::Painter, screen: egui::Rect, path: &Path, alpha: f32) {
+fn paint_cover(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    path: &Path,
+    alpha: f32,
+) {
     let uri = format!("file://{}", path.display());
-    let Ok(egui::load::TexturePoll::Ready { texture }) =
-        ctx.try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::SizeHint::default())
-    else {
+    let Ok(egui::load::TexturePoll::Ready { texture }) = ctx.try_load_texture(
+        &uri,
+        egui::TextureOptions::LINEAR,
+        egui::SizeHint::default(),
+    ) else {
         return;
     };
     let scale = (screen.width() / texture.size.x).max(screen.height() / texture.size.y);
     let rect = egui::Rect::from_center_size(screen.center(), texture.size * scale);
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    painter.image(texture.id, rect, uv, Color32::from_gray(BG_DIM).gamma_multiply(alpha));
+    painter.image(
+        texture.id,
+        rect,
+        uv,
+        Color32::from_gray(BG_DIM).gamma_multiply(alpha),
+    );
 }
 
 impl eframe::App for App {
@@ -233,7 +263,9 @@ impl eframe::App for App {
             .collect();
         self.selected = self.selected.min(shown.len().saturating_sub(1));
 
-        let next_bg = shown.get(self.selected).and_then(|&i| self.games[i].background.clone());
+        let next_bg = shown
+            .get(self.selected)
+            .and_then(|&i| self.games[i].background.clone());
         self.paint_background(ctx, next_bg.as_ref());
 
         let gray = Color32::from_gray(140);
@@ -241,7 +273,11 @@ impl eframe::App for App {
         let mut hovered = None;
 
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin::symmetric(20, 10)))
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let title = match shown.get(self.selected) {
@@ -264,7 +300,8 @@ impl eframe::App for App {
                 }
 
                 let w = self.card_w;
-                let cols = ((((ui.available_width() - 2.0 * PAD) + GAP) / (w + GAP)) as usize).max(1);
+                let cols =
+                    ((((ui.available_width() - 2.0 * PAD) + GAP) / (w + GAP)) as usize).max(1);
 
                 // Arrow keys are consumed so the text box doesn't move its cursor
                 if !shown.is_empty() {
@@ -312,41 +349,47 @@ impl eframe::App for App {
                 if shown.is_empty() {
                     ui.add_space(80.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("No games match your search").size(18.0).color(gray));
+                        ui.label(
+                            RichText::new("No games match your search")
+                                .size(18.0)
+                                .color(gray),
+                        );
                     });
                 }
 
                 let selected = self.selected;
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = vec2(GAP, GAP);
-                    let total = cols as f32 * w + (cols as f32 - 1.0) * GAP;
-                    let margin = ((ui.available_width() - total) / 2.0).max(0.0);
-                    ui.add_space(PAD);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+                        let total = cols as f32 * w + (cols as f32 - 1.0) * GAP;
+                        let margin = ((ui.available_width() - total) / 2.0).max(0.0);
+                        ui.add_space(PAD);
 
-                    for (r, chunk) in shown.chunks(cols).enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.add_space(margin);
-                            for (c, &i) in chunk.iter().enumerate() {
-                                if c > 0 {
-                                    ui.add_space(GAP);
+                        for (r, chunk) in shown.chunks(cols).enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add_space(margin);
+                                for (c, &i) in chunk.iter().enumerate() {
+                                    if c > 0 {
+                                        ui.add_space(GAP);
+                                    }
+                                    let n = r * cols + c;
+                                    let resp = card(ui, &self.games[i], w, n == selected, moved);
+                                    if resp.clicked() {
+                                        to_launch = Some(i);
+                                    }
+                                    // hovering selects, but only when the mouse actually moves
+                                    if resp.hovered()
+                                        && ui.input(|inp| inp.pointer.delta() != egui::Vec2::ZERO)
+                                    {
+                                        hovered = Some(n);
+                                    }
                                 }
-                                let n = r * cols + c;
-                                let resp = card(ui, &self.games[i], w, n == selected, moved);
-                                if resp.clicked() {
-                                    to_launch = Some(i);
-                                }
-                                // hovering selects, but only when the mouse actually moves
-                                if resp.hovered()
-                                    && ui.input(|inp| inp.pointer.delta() != egui::Vec2::ZERO)
-                                {
-                                    hovered = Some(n);
-                                }
-                            }
-                        });
-                    }
-                    ui.add_space(PAD);
-                });
+                            });
+                        }
+                        ui.add_space(PAD);
+                    });
             });
 
         if let Some(n) = hovered {

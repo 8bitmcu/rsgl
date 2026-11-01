@@ -61,7 +61,10 @@ pub struct UiCfg {
 
 impl Default for UiCfg {
     fn default() -> Self {
-        Self { card_width: 170.0, blur: 8.0 }
+        Self {
+            card_width: 170.0,
+            blur: 8.0,
+        }
     }
 }
 
@@ -88,7 +91,13 @@ pub struct Game {
 
 pub fn slug(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -104,7 +113,10 @@ pub fn expand(s: &str) -> String {
 
 /// Everything rsgl downloads or generates lives under ~/.cache/rsgl.
 fn cache_dir() -> PathBuf {
-    directories::BaseDirs::new().unwrap().cache_dir().join("rsgl")
+    directories::BaseDirs::new()
+        .unwrap()
+        .cache_dir()
+        .join("rsgl")
 }
 
 pub fn covers_dir() -> PathBuf {

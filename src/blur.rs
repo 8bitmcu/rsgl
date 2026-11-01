@@ -33,7 +33,11 @@ pub fn blurred(src: &Path, dest: &Path, sigma: f32) -> Result<PathBuf, Box<dyn E
     let small = image::open(src)?
         .resize(MAX_SIDE, MAX_SIDE, imageops::FilterType::Triangle)
         .to_rgb8();
-    let out = if sigma > 0.0 { imageops::blur(&small, sigma) } else { small };
+    let out = if sigma > 0.0 {
+        imageops::blur(&small, sigma)
+    } else {
+        small
+    };
 
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
