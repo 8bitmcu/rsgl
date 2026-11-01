@@ -8,6 +8,9 @@ If you give it a [SteamGridDB](https://www.steamgriddb.com/) API key, it
 downloads missing covers and hero images for you, then draws a blurred version
 of the selected game's art behind the grid.
 
+
+![preview](assets/preview.gif)
+
 ## Features
 
 - Cover-art grid with search-as-you-type filtering
