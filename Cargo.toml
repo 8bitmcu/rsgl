@@ -1,0 +1,40 @@
+[package]
+name = "rsgl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# no accesskit: skips building the screen reader stack and its D-Bus setup at startup
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# not used directly: keeps winit's default features (wayland-dlopen, adwaita window decorations) that eframe's defaults turned on
+winit = "0.30"
+# only file:// png/jpeg/webp are loaded; all_loaders also built svg (resvg) and http (ehttp)
+egui_extras = { version = "0.31", default-features = false, features = ["file", "image", "webp"] }
+# the default formats pull in avif (the rav1e encoder), exr, tiff and more that we never read
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+directories = "5"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+ureq = { version = "2", features = ["json"] }
+urlencoding = "2.1.3"
+
+# debug info for dependencies is rarely needed and makes building and linking slower
+[profile.dev.package."*"]
+debug = false
+
+# blurring backgrounds is ~25x slower unoptimized
+[profile.dev.package.image]
+opt-level = 3
+
+# covers are decoded on the UI thread, so unoptimized decoders stall the first frames
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.image-webp]
+opt-level = 3
