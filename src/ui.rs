@@ -1,13 +1,17 @@
 use crate::{
     api,
-    config::{ApiCfg, Game, UiCfg},
-    launch,
+    config::{self, ApiCfg, Game, PlaytimeCfg, UiCfg},
+    launch, playtime, Launched,
 };
 use eframe::egui;
 use egui::{vec2, Align, Align2, Color32, FontId, Key, Modifiers, RichText, Stroke};
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    rc::Rc,
     sync::mpsc,
+    thread,
 };
 
 const ACCENT: Color32 = Color32::from_rgb(0x7a, 0xa2, 0xf7);
@@ -24,30 +28,32 @@ const PAD: f32 = LIFT + OUTLINE + 1.0;
 const FADE: f32 = 0.4;
 /// How bright the background is drawn (0-255), so cards stay readable.
 const BG_DIM: u8 = 90;
+/// Widest the search bar gets, so it doesn't stretch across ultrawide screens.
+const SEARCH_MAX_W: f32 = 720.0;
 
-/// Opens the window and runs the launcher until it closes.
-pub fn run(games: Vec<Game>, cfg: UiCfg, api_cfg: ApiCfg, error: Option<String>) -> eframe::Result {
+/// Opens the window and runs the launcher until it closes. Returns the launched
+/// game if it should have its playtime tracked.
+pub fn run(
+    games: Vec<Game>,
+    cfg: UiCfg,
+    api_cfg: ApiCfg,
+    pt_cfg: PlaytimeCfg,
+    error: Option<String>,
+) -> eframe::Result<Option<Launched>> {
     let key = api_cfg.steamgriddb_key();
-    let blur = cfg.blur.clamp(0.0, 50.0);
-    let jobs: Vec<api::Job> = games
-        .iter()
-        .enumerate()
-        .map(|(i, g)| api::Job {
-            index: i,
-            name: g.name.clone(),
-            cover: g.cover.clone().filter(|p| p.exists()),
-        })
-        .collect();
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([520.0, 400.0])
-            .with_maximized(true)
             .with_title("Games")
-            .with_app_id("rsgl"),
+            .with_app_id("rsgl")
+            .with_maximized(cfg.start_maximized),
         ..Default::default()
     };
+
+    let playtime = pt_cfg.enabled.then(playtime::load);
+    let launched = Rc::new(RefCell::new(None));
+    let out = launched.clone();
 
     eframe::run_native(
         "Games",
@@ -55,22 +61,59 @@ pub fn run(games: Vec<Game>, cfg: UiCfg, api_cfg: ApiCfg, error: Option<String>)
         Box::new(move |cc| {
             apply_theme(&cc.egui_ctx);
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            let ctx = cc.egui_ctx.clone();
-            let rx = api::spawn_fetcher(jobs, key, blur, move || ctx.request_repaint());
+            let rx = fetch(&cc.egui_ctx, &games, key, cfg.blur);
             Ok(Box::new(App {
                 games,
                 error,
                 query: String::new(),
                 prev_query: String::new(),
                 selected: 0,
+                page_rows: 1,
                 card_w: cfg.card_width.clamp(80.0, 400.0),
                 rx,
                 bg: None,
                 prev_bg: None,
                 bg_since: 0.0,
+                playtime,
+                launched,
+                maximize: cfg.start_maximized,
             }))
         }),
-    )
+    )?;
+    Ok(out.take())
+}
+
+/// Starts downloading and blurring art for `games` in the background.
+/// The updates refer to games by their index in `games`.
+fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) -> mpsc::Receiver<api::Update> {
+    let jobs: Vec<api::Job> = games
+        .iter()
+        .enumerate()
+        .map(|(i, g)| api::Job {
+            index: i,
+            name: g.name.clone(),
+            cover: g.cover.clone().filter(|p| p.exists()),
+            art_id: g.art_id,
+        })
+        .collect();
+    let ctx = ctx.clone();
+    api::spawn_fetcher(jobs, key, blur.clamp(0.0, 50.0), move || ctx.request_repaint())
+}
+
+/// Opens `dir` in the file manager.
+fn open_folder(dir: &Path) {
+    let child = Command::new("xdg-open")
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            thread::spawn(move || c.wait()); // reap it so it doesn't linger as a zombie
+        }
+        Err(e) => eprintln!("can't run xdg-open: {e}"),
+    }
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -113,20 +156,11 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
         }
         None => {
             // colored placeholder derived from the name
-            let hash = g
-                .name
-                .bytes()
-                .fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
+            let hash = g.name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
             let hue = (hash % 360) as f32 / 360.0;
             let fill = Color32::from(egui::ecolor::Hsva::new(hue, 0.45, 0.35, 1.0));
             ui.painter().rect_filled(cover, radius, fill);
-            let initial: String = g
-                .name
-                .chars()
-                .next()
-                .unwrap_or('?')
-                .to_uppercase()
-                .collect();
+            let initial: String = g.name.chars().next().unwrap_or('?').to_uppercase().collect();
             ui.painter().text(
                 cover.center(),
                 Align2::CENTER_CENTER,
@@ -148,11 +182,7 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
 
     let label_rect =
         egui::Rect::from_min_size(rect.min + vec2(0.0, cover_h + 8.0), vec2(w, LABEL_H - 8.0));
-    let color = if selected {
-        Color32::WHITE
-    } else {
-        Color32::from_gray(170)
-    };
+    let color = if selected { Color32::WHITE } else { Color32::from_gray(170) };
     ui.put(
         label_rect,
         egui::Label::new(RichText::new(&g.name).size(13.0).color(color))
@@ -169,14 +199,48 @@ struct App {
     query: String,
     prev_query: String,
     selected: usize, // position within the filtered list
+    page_rows: usize, // rows that fit in the grid, for PageUp/PageDown
     card_w: f32,
     rx: mpsc::Receiver<api::Update>,
     bg: Option<PathBuf>,      // background currently fading in / shown
     prev_bg: Option<PathBuf>, // background fading out
     bg_since: f64,            // when `bg` last changed
+    playtime: Option<playtime::Playtime>, // None when playtime is disabled
+    launched: Rc<RefCell<Option<Launched>>>,
+    maximize: bool, // send a maximize request on the first frame
 }
 
 impl App {
+    /// Indices of the games matching the search.
+    fn filtered(&self) -> Vec<usize> {
+        let q = self.query.to_lowercase();
+        (0..self.games.len())
+            .filter(|&i| self.games[i].name.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Reads the config again and restarts the fetcher for the new game list.
+    /// On an error the current games are kept. Window and playtime settings
+    /// still need a restart.
+    fn reload(&mut self, ctx: &egui::Context) {
+        let (mut games, ui, api) = match config::load() {
+            Ok((g, u, a, _)) => (g, u, a),
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        // keep showing the current backgrounds until the fetcher sends them again
+        for g in &mut games {
+            g.background = self.games.iter().find(|o| o.name == g.name).and_then(|o| o.background.clone());
+        }
+        // replacing rx drops the old receiver, which stops the old fetcher
+        self.rx = fetch(ctx, &games, api.steamgriddb_key(), ui.blur);
+        self.games = games;
+        self.card_w = ui.card_width.clamp(80.0, 400.0);
+        self.error = None;
+    }
+
     /// Crossfades to `next` whenever it differs from the current background.
     fn paint_background(&mut self, ctx: &egui::Context, next: Option<&PathBuf>) {
         let now = ctx.input(|i| i.time);
@@ -207,34 +271,28 @@ impl App {
 
 /// Draws the image at `path` scaled to cover `screen` (cropping the overflow),
 /// dimmed and at the given opacity. Draws nothing until the texture is loaded.
-fn paint_cover(
-    ctx: &egui::Context,
-    painter: &egui::Painter,
-    screen: egui::Rect,
-    path: &Path,
-    alpha: f32,
-) {
+fn paint_cover(ctx: &egui::Context, painter: &egui::Painter, screen: egui::Rect, path: &Path, alpha: f32) {
     let uri = format!("file://{}", path.display());
-    let Ok(egui::load::TexturePoll::Ready { texture }) = ctx.try_load_texture(
-        &uri,
-        egui::TextureOptions::LINEAR,
-        egui::SizeHint::default(),
-    ) else {
+    let Ok(egui::load::TexturePoll::Ready { texture }) =
+        ctx.try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::SizeHint::default())
+    else {
         return;
     };
     let scale = (screen.width() / texture.size.x).max(screen.height() / texture.size.y);
     let rect = egui::Rect::from_center_size(screen.center(), texture.size * scale);
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    painter.image(
-        texture.id,
-        rect,
-        uv,
-        Color32::from_gray(BG_DIM).gamma_multiply(alpha),
-    );
+    painter.image(texture.id, rect, uv, Color32::from_gray(BG_DIM).gamma_multiply(alpha));
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // with_maximized alone is ignored by some X11 window managers (xfwm4),
+        // because winit asks before the window is shown. eframe shows it after
+        // the first frame, so asking again from here works there too.
+        if std::mem::take(&mut self.maximize) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
         while let Ok(update) = self.rx.try_recv() {
             match update {
                 api::Update::Cover(i, path) => self.games[i].cover = Some(path),
@@ -258,15 +316,21 @@ impl eframe::App for App {
             moved = true;
         }
 
-        let q = self.query.to_lowercase();
-        let shown: Vec<usize> = (0..self.games.len())
-            .filter(|&i| self.games[i].name.to_lowercase().contains(&q))
-            .collect();
+        if ctx.input(|i| i.key_pressed(Key::F5)) {
+            let current = self.filtered().get(self.selected).map(|&i| self.games[i].name.clone());
+            self.reload(ctx);
+            let shown = self.filtered();
+            self.selected = shown
+                .iter()
+                .position(|&i| Some(&self.games[i].name) == current.as_ref())
+                .unwrap_or(0);
+            moved = true;
+        }
+
+        let shown = self.filtered();
         self.selected = self.selected.min(shown.len().saturating_sub(1));
 
-        let next_bg = shown
-            .get(self.selected)
-            .and_then(|&i| self.games[i].background.clone());
+        let next_bg = shown.get(self.selected).and_then(|&i| self.games[i].background.clone());
         self.paint_background(ctx, next_bg.as_ref());
 
         let gray = Color32::from_gray(140);
@@ -274,11 +338,7 @@ impl eframe::App for App {
         let mut hovered = None;
 
         egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .inner_margin(egui::Margin::symmetric(20, 10)),
-            )
+            .frame(egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin::symmetric(20, 10)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let title = match shown.get(self.selected) {
@@ -286,6 +346,13 @@ impl eframe::App for App {
                         None => "No games".to_string(),
                     };
                     ui.label(RichText::new(title).strong().size(15.0));
+                    let entry = shown
+                        .get(self.selected)
+                        .zip(self.playtime.as_ref())
+                        .and_then(|(&i, pt)| pt.get(&self.games[i].name));
+                    if let Some(e) = entry {
+                        ui.label(RichText::new(format!("· {}", playtime::describe(e))).color(gray));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(format!("{} games", shown.len())).color(gray));
                     });
@@ -301,17 +368,18 @@ impl eframe::App for App {
                 }
 
                 let w = self.card_w;
-                let cols =
-                    ((((ui.available_width() - 2.0 * PAD) + GAP) / (w + GAP)) as usize).max(1);
+                let cols = ((((ui.available_width() - 2.0 * PAD) + GAP) / (w + GAP)) as usize).max(1);
 
                 // Arrow keys are consumed so the text box doesn't move its cursor
                 if !shown.is_empty() {
-                    let (l, r, u, d) = ctx.input_mut(|i| {
+                    let (l, r, u, d, pu, pd) = ctx.input_mut(|i| {
                         (
                             i.consume_key(Modifiers::NONE, Key::ArrowLeft),
                             i.consume_key(Modifiers::NONE, Key::ArrowRight),
                             i.consume_key(Modifiers::NONE, Key::ArrowUp),
                             i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                            i.consume_key(Modifiers::NONE, Key::PageUp),
+                            i.consume_key(Modifiers::NONE, Key::PageDown),
                         )
                     });
                     let mut s = self.selected as isize;
@@ -327,6 +395,13 @@ impl eframe::App for App {
                     if d {
                         s += cols as isize;
                     }
+                    let page = (cols * self.page_rows) as isize;
+                    if pu {
+                        s -= page;
+                    }
+                    if pd {
+                        s += page;
+                    }
                     let s = s.clamp(0, shown.len() as isize - 1) as usize;
                     if s != self.selected {
                         self.selected = s;
@@ -337,67 +412,75 @@ impl eframe::App for App {
                     }
                 }
 
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search games…   (arrows to move, Enter to launch)")
-                        .font(FontId::proportional(18.0))
-                        .margin(egui::Margin::symmetric(14, 10))
-                        .desired_width(f32::INFINITY),
-                )
-                .request_focus();
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.query)
+                            .hint_text("Search games…   (arrows to move, Enter to launch, F5 to reload)")
+                            .font(FontId::proportional(18.0))
+                            .margin(egui::Margin::symmetric(14, 10))
+                            .desired_width(ui.available_width().min(SEARCH_MAX_W)),
+                    )
+                    .request_focus();
+                });
                 ui.add_space(20.0);
 
                 if shown.is_empty() {
                     ui.add_space(80.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("No games match your search")
-                                .size(18.0)
-                                .color(gray),
-                        );
+                        ui.label(RichText::new("No games match your search").size(18.0).color(gray));
                     });
                 }
 
                 let selected = self.selected;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = vec2(GAP, GAP);
-                        let total = cols as f32 * w + (cols as f32 - 1.0) * GAP;
-                        let margin = ((ui.available_width() - total) / 2.0).max(0.0);
-                        ui.add_space(PAD);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+                    let row_h = w * 1.5 + LABEL_H + GAP;
+                    self.page_rows = ((ui.clip_rect().height() / row_h) as usize).max(1);
+                    ui.add_space(PAD);
 
-                        for (r, chunk) in shown.chunks(cols).enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add_space(margin);
-                                for (c, &i) in chunk.iter().enumerate() {
-                                    if c > 0 {
-                                        ui.add_space(GAP);
-                                    }
-                                    let n = r * cols + c;
-                                    let resp = card(ui, &self.games[i], w, n == selected, moved);
-                                    if resp.clicked() {
-                                        to_launch = Some(i);
-                                    }
-                                    // hovering selects, but only when the mouse actually moves
-                                    if resp.hovered()
-                                        && ui.input(|inp| inp.pointer.delta() != egui::Vec2::ZERO)
-                                    {
-                                        hovered = Some(n);
+                    // each row is centered on its own, so short rows line up under the search bar
+                    for (r, chunk) in shown.chunks(cols).enumerate() {
+                        let n_row = chunk.len() as f32;
+                        let total = n_row * w + (n_row - 1.0) * GAP;
+                        let margin = ((ui.available_width() - total) / 2.0).max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.add_space(margin);
+                            for (c, &i) in chunk.iter().enumerate() {
+                                if c > 0 {
+                                    ui.add_space(GAP);
+                                }
+                                let n = r * cols + c;
+                                let resp = card(ui, &self.games[i], w, n == selected, moved);
+                                if resp.clicked() {
+                                    to_launch = Some(i);
+                                }
+                                if resp.secondary_clicked() {
+                                    if let Some(dir) = &self.games[i].workdir {
+                                        open_folder(dir);
                                     }
                                 }
-                            });
-                        }
-                        ui.add_space(PAD);
-                    });
+                                // hovering selects, but only when the mouse actually moves
+                                if resp.hovered()
+                                    && ui.input(|inp| inp.pointer.delta() != egui::Vec2::ZERO)
+                                {
+                                    hovered = Some(n);
+                                }
+                            }
+                        });
+                    }
+                    ui.add_space(PAD);
+                });
             });
 
         if let Some(n) = hovered {
             self.selected = n;
         }
         if let Some(i) = to_launch {
-            launch(&self.games[i]);
+            let g = &self.games[i];
+            if let Some(pgid) = launch(g).filter(|_| g.playtime) {
+                *self.launched.borrow_mut() = Some(Launched { name: g.name.clone(), pgid });
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

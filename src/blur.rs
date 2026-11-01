@@ -23,8 +23,12 @@ pub fn reset_if_changed(dir: &Path, sigma: f32) {
 }
 
 /// Writes a blurred copy of `src` to `dest` and returns `dest`. Skips the work
-/// if `dest` is already newer than `src`. A `sigma` of 0 skips the blur.
+/// if `dest` is already newer than `src`. With a `sigma` of 0 there's nothing
+/// to hide the downscale, so `src` itself is returned at full resolution.
 pub fn blurred(src: &Path, dest: &Path, sigma: f32) -> Result<PathBuf, Box<dyn Error>> {
+    if sigma <= 0.0 {
+        return Ok(src.to_path_buf());
+    }
     let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
     if mtime(dest).unwrap_or(SystemTime::UNIX_EPOCH) >= mtime(src).ok_or("source missing")? {
         return Ok(dest.to_path_buf());
@@ -33,11 +37,7 @@ pub fn blurred(src: &Path, dest: &Path, sigma: f32) -> Result<PathBuf, Box<dyn E
     let small = image::open(src)?
         .resize(MAX_SIDE, MAX_SIDE, imageops::FilterType::Triangle)
         .to_rgb8();
-    let out = if sigma > 0.0 {
-        imageops::blur(&small, sigma)
-    } else {
-        small
-    };
+    let out = imageops::blur(&small, sigma);
 
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;

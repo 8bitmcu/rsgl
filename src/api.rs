@@ -20,6 +20,12 @@ struct Response<T> {
     data: Vec<T>,
 }
 
+/// Like `Response`, for endpoints that return a single object.
+#[derive(Deserialize)]
+struct Single<T> {
+    data: Option<T>,
+}
+
 #[derive(Deserialize)]
 struct GameHit {
     id: u64,
@@ -63,6 +69,17 @@ impl Client {
         let hits: Response<GameHit> = self.get(&path)?;
         let exact = hits.data.iter().find(|h| h.name.eq_ignore_ascii_case(name));
         Ok(exact.or(hits.data.first()).map(|h| h.id))
+    }
+
+    /// SteamGridDB game id for a configured id, without searching by name.
+    fn resolve(&self, id: config::ArtId) -> Res<Option<u64>> {
+        match id {
+            config::ArtId::SteamGridDb(id) => Ok(Some(id)),
+            config::ArtId::Steam(app) => {
+                let hit: Single<GameHit> = self.get(&format!("/games/steam/{app}"))?;
+                Ok(hit.data.map(|h| h.id))
+            }
+        }
     }
 
     /// Best-scored `kind` ("grids" or "heroes") asset for a game, trying each
@@ -115,6 +132,10 @@ impl Client {
         let mut file = fs::File::create(&tmp)?;
         io::copy(&mut reader, &mut file)?;
         fs::rename(&tmp, &dest)?; // rename so a half-download is never picked up
+        // a replaced image may have had another extension, which find_image could prefer
+        for other in ["png", "jpg", "webp"].into_iter().filter(|&e| e != ext) {
+            let _ = fs::remove_file(dest.with_extension(other));
+        }
         Ok(Some(dest))
     }
 }
@@ -130,6 +151,13 @@ pub struct Job {
     pub name: String,
     /// Existing cover, if any.
     pub cover: Option<PathBuf>,
+    /// Configured id to look the game up by instead of its name.
+    pub art_id: Option<config::ArtId>,
+}
+
+/// Remembers which configured id the cached cover and hero were fetched with.
+fn art_id_marker(name: &str) -> PathBuf {
+    config::covers_dir().join(format!("{}.id", config::slug(name)))
 }
 
 /// Blurs the hero (or the cover if there's no hero) into the backgrounds cache.
@@ -193,21 +221,38 @@ pub fn spawn_fetcher(
         // pass 2: fill in whatever is missing from SteamGridDB
         let Some(client) = client else { return };
         for (j, hero) in &mut jobs {
+            let name = &j.name;
+            // cached art from a name search (or an older id) may be the wrong game,
+            // so fetch it again once with the configured id. Covers set with
+            // `cover = ...` outside the cache are left alone.
+            let marker = art_id_marker(name);
+            if let Some(art) = j.art_id {
+                if fs::read_to_string(&marker).ok() != Some(art.to_string()) {
+                    if j.cover.is_some() && j.cover == config::find_cover(name) {
+                        j.cover = None;
+                    }
+                    *hero = None;
+                }
+            }
             if j.cover.is_some() && hero.is_some() {
                 continue;
             }
-            let name = &j.name;
-            let id = match client.search(name) {
+            let found = match j.art_id {
+                Some(art) => client.resolve(art),
+                None => client.search(name),
+            };
+            let id = match found {
                 Ok(Some(id)) => id,
                 Ok(None) => {
                     eprintln!("no SteamGridDB match for {name:?}");
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("SteamGridDB search failed for {name:?}: {e}");
+                    eprintln!("SteamGridDB lookup failed for {name:?}: {e}");
                     continue;
                 }
             };
+            let mut failed = false;
 
             if j.cover.is_none() {
                 match client.fetch_cover(id, name) {
@@ -218,15 +263,25 @@ pub fn spawn_fetcher(
                         }
                     }
                     Ok(None) => eprintln!("no cover found for {name:?}"),
-                    Err(e) => eprintln!("cover fetch failed for {name:?}: {e}"),
+                    Err(e) => {
+                        eprintln!("cover fetch failed for {name:?}: {e}");
+                        failed = true;
+                    }
                 }
             }
             if hero.is_none() {
                 match client.fetch_hero(id, name) {
                     Ok(Some(path)) => *hero = Some(path),
                     Ok(None) => eprintln!("no hero found for {name:?}"),
-                    Err(e) => eprintln!("hero fetch failed for {name:?}: {e}"),
+                    Err(e) => {
+                        eprintln!("hero fetch failed for {name:?}: {e}");
+                        failed = true;
+                    }
                 }
+            }
+            if let Some(art) = j.art_id.filter(|_| !failed) {
+                let _ = fs::create_dir_all(config::covers_dir())
+                    .and_then(|_| fs::write(&marker, art.to_string()));
             }
 
             // cheap if nothing changed, blurred() reuses the cached file

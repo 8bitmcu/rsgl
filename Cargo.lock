@@ -2132,12 +2132,13 @@ dependencies = [
 
 [[package]]
 name = "rsgl"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "directories",
  "eframe",
  "egui_extras",
  "image",
+ "libc",
  "serde",
  "toml",
  "ureq",
