@@ -14,6 +14,7 @@ of the selected game's art behind the grid.
 ## Features
 
 - Cover-art grid with search-as-you-type filtering
+- Tags, with `t:tag` filtering in the search bar
 - Full keyboard control, mouse works too
 - Automatic cover and hero downloads from SteamGridDB (optional)
 - Blurred, crossfading background for the selected game
@@ -21,6 +22,7 @@ of the selected game's art behind the grid.
 - Games are started detached, so they keep running after the launcher closes
 - Playtime tracking per game, shown in the status bar
 - Single instance mode, so a second launcher window can't be opened
+- Command-line flags for fullscreen, an alternate config file and a starting search
 - Games without a cover get a colored placeholder with their initial
 
 ## Building
@@ -41,6 +43,8 @@ rsgl reads the first of these files that exists:
 
 1. `$XDG_CONFIG_HOME/rsgl/rsgl.toml` (usually `~/.config/rsgl/rsgl.toml`)
 2. `~/.rsgl.toml`
+
+Pass `-c <file>` to use a different file instead (see [Command line](#command-line)).
 
 If neither exists, the first run writes an example config to
 `~/.config/rsgl/rsgl.toml` and shows a message telling you to edit it and
@@ -73,6 +77,7 @@ workdir = "~/games/example"                  # optional
 env = { SOME_VAR = "value" }                 # optional
 playtime = false                             # optional, don't track this game
 hidden = true                                # optional, keep the entry but leave it out of the grid
+tags = ["coop", "lan", "fps"]                # optional, filter with t:coop in the search bar
 steam_appid = 367520                         # optional, find art by Steam app id
 steamgriddb_id = 1234                        # optional, find art by SteamGridDB game id
 ```
@@ -90,6 +95,34 @@ Notes on `[[game]]` entries:
   `steamgriddb_id` wins. Adding or changing an id re-downloads the cached cover
   and hero once, replacing what's in the cache.
 - `hidden = true` hides a game without deleting its entry.
+- `tags` is a list of labels for the game, see [Tags](#tags).
+
+### Tags
+
+Give a game any number of `tags` and filter by them from the search bar with
+the `t:` prefix:
+
+```toml
+[[game]]
+name = "Left 4 Dead 2"
+exec = "..."
+tags = ["coop", "fps"]
+```
+
+| Search            | Shows                                                |
+| ----------------- | ---------------------------------------------------- |
+| `t:coop`          | games tagged `coop`                                  |
+| `t:coop t:fps`    | games that have both tags                            |
+| `t:coop left`     | `coop` games with "left" in the name                 |
+| `t:co`            | tags that start with `co` (`coop`, `couch`, ...)     |
+
+- Tag matching is case-insensitive and matches the start of a tag, so the grid
+  narrows as you type. A bare `t:` doesn't filter anything yet.
+- Anything in the search that isn't a `t:` word is matched against the game name
+  as before. Extra spaces are ignored.
+- Tags can't contain spaces, since the search splits on whitespace. Use
+  something like `local-mp` or `local_mp`.
+- The selected game's tags are shown in the status bar.
 
 ### Playtime
 
@@ -128,17 +161,37 @@ config as shown above, or with the `STEAMGRIDDB_API_KEY` environment variable,
 which takes priority over the config file. Without a key, rsgl only uses
 images that are already on disk.
 
+## Command line
+
+```
+Usage: rsgl [OPTIONS]
+
+Options:
+  -c, --config <FILE>  Read this config file instead of the default locations
+  -f, --fullscreen     Start fullscreen
+  -s, --search <TEXT>  Start with TEXT in the search bar (t:tag filters by tag)
+  -h, --help           Show this help
+```
+
+- `--config` replaces the default lookup rather than going first. The file has
+  to exist: rsgl exits with an error if it doesn't, and never writes an example
+  config to a path you gave it. F5 reloads the same file. `--config=FILE` works
+  too, and a leading `~` is expanded.
+- `--fullscreen` wins over `start_maximized`.
+- `--search` fills in the search bar and applies it right away, for example
+  `rsgl -s "t:coop"`. Esc clears it like any other search.
+
 ## Controls
 
-| Key           | Action                                   |
-| ------------- | ---------------------------------------- |
-| Type          | Filter games by name                     |
-| Arrow keys    | Move the selection                       |
-| PageUp/Down   | Move the selection a screen up or down   |
-| Enter / click | Launch the selected game and close rsgl  |
-| Right-click   | Menu with "Open game folder" (`workdir`) |
-| F5            | Reload the config                        |
-| Esc           | Clear the search, or quit if it's empty  |
+| Key           | Action                                        |
+| ------------- | --------------------------------------------- |
+| Type          | Filter games by name, or `t:tag` by tag       |
+| Arrow keys    | Move the selection                            |
+| PageUp/Down   | Move the selection a screen up or down        |
+| Enter / click | Launch the selected game and close rsgl       |
+| Right-click   | Open the game's `workdir` in the file manager |
+| F5            | Reload the config                             |
+| Esc           | Clear the search, or quit if it's empty       |
 
 ## Cache
 

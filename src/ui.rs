@@ -39,6 +39,8 @@ pub fn run(
     api_cfg: ApiCfg,
     pt_cfg: PlaytimeCfg,
     error: Option<String>,
+    fullscreen: bool,
+    search: String,
 ) -> eframe::Result<Option<Launched>> {
     let key = api_cfg.steamgriddb_key();
     let options = eframe::NativeOptions {
@@ -47,7 +49,8 @@ pub fn run(
             .with_min_inner_size([520.0, 400.0])
             .with_title("Games")
             .with_app_id("rsgl")
-            .with_maximized(cfg.start_maximized),
+            .with_maximized(cfg.start_maximized && !fullscreen)
+            .with_fullscreen(fullscreen),
         ..Default::default()
     };
 
@@ -65,8 +68,8 @@ pub fn run(
             Ok(Box::new(App {
                 games,
                 error,
-                query: String::new(),
-                prev_query: String::new(),
+                query: search.clone(),
+                prev_query: search,
                 selected: 0,
                 page_rows: 1,
                 card_w: cfg.card_width.clamp(80.0, 400.0),
@@ -76,7 +79,8 @@ pub fn run(
                 bg_since: 0.0,
                 playtime,
                 launched,
-                maximize: cfg.start_maximized,
+                maximize: cfg.start_maximized && !fullscreen,
+                fullscreen,
             }))
         }),
     )?;
@@ -208,14 +212,36 @@ struct App {
     playtime: Option<playtime::Playtime>, // None when playtime is disabled
     launched: Rc<RefCell<Option<Launched>>>,
     maximize: bool, // send a maximize request on the first frame
+    fullscreen: bool, // same for fullscreen (-f)
+}
+
+/// Splits a search into the name text and its `t:` tag filters, all lowercased:
+/// "t:coop t:lan quake" gives ("quake", ["coop", "lan"]).
+fn parse_query(query: &str) -> (String, Vec<String>) {
+    let mut name = Vec::new();
+    let mut tags = Vec::new();
+    for word in query.to_lowercase().split_whitespace() {
+        match word.strip_prefix("t:") {
+            Some("") => {} // still typing the tag, don't filter yet
+            Some(tag) => tags.push(tag.to_string()),
+            None => name.push(word.to_string()),
+        }
+    }
+    (name.join(" "), tags)
 }
 
 impl App {
     /// Indices of the games matching the search.
     fn filtered(&self) -> Vec<usize> {
-        let q = self.query.to_lowercase();
+        let (name, tags) = parse_query(&self.query);
         (0..self.games.len())
-            .filter(|&i| self.games[i].name.to_lowercase().contains(&q))
+            .filter(|&i| {
+                let g = &self.games[i];
+                g.name.to_lowercase().contains(&name)
+                    && tags
+                        .iter()
+                        .all(|t| g.tags.iter().any(|gt| gt.to_lowercase().starts_with(t)))
+            })
             .collect()
     }
 
@@ -292,6 +318,9 @@ impl eframe::App for App {
         if std::mem::take(&mut self.maximize) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
+        if std::mem::take(&mut self.fullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
 
         while let Ok(update) = self.rx.try_recv() {
             match update {
@@ -352,6 +381,12 @@ impl eframe::App for App {
                         .and_then(|(&i, pt)| pt.get(&self.games[i].name));
                     if let Some(e) = entry {
                         ui.label(RichText::new(format!("· {}", playtime::describe(e))).color(gray));
+                    }
+                    if let Some(&i) = shown.get(self.selected) {
+                        let tags = &self.games[i].tags;
+                        if !tags.is_empty() {
+                            ui.label(RichText::new(format!("· {}", tags.join(", "))).color(gray));
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(format!("{} games", shown.len())).color(gray));
@@ -415,7 +450,7 @@ impl eframe::App for App {
                 ui.vertical_centered(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search games…   (arrows to move, Enter to launch, F5 to reload)")
+                            .hint_text("Search games or t:tag…   (arrows to move, Enter to launch, F5 to reload)")
                             .font(FontId::proportional(18.0))
                             .margin(egui::Margin::symmetric(14, 10))
                             .desired_width(ui.available_width().min(SEARCH_MAX_W)),

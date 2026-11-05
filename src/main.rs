@@ -8,7 +8,7 @@ use config::{ApiCfg, Game, PlaytimeCfg, UiCfg};
 use std::{
     fs::{self, File},
     os::unix::process::CommandExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -41,6 +41,52 @@ fn lock(path: &Path, wait: bool) -> Option<File> {
     locked.then_some(f)
 }
 
+const USAGE: &str = "\
+Usage: rsgl [OPTIONS]
+
+Options:
+  -c, --config <FILE>  Read this config file instead of the default locations
+  -f, --fullscreen     Start fullscreen
+  -s, --search <TEXT>  Start with TEXT in the search bar (t:tag filters by tag)
+  -h, --help           Show this help
+";
+
+struct Cli {
+    fullscreen: bool,
+    config: Option<PathBuf>,
+    search: String,
+}
+
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
+    let mut cli = Cli { fullscreen: false, config: None, search: String::new() };
+    while let Some(arg) = args.next() {
+        // `--flag=value` is the same as `--flag value`
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        match flag {
+            "-f" | "--fullscreen" if inline.is_none() => cli.fullscreen = true,
+            "-h" | "--help" if inline.is_none() => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-c" | "--config" | "-s" | "--search" => {
+                let value = inline
+                    .or_else(|| args.next())
+                    .ok_or_else(|| format!("{flag} needs an argument"))?;
+                if flag == "-c" || flag == "--config" {
+                    cli.config = Some(PathBuf::from(config::expand(&value)));
+                } else {
+                    cli.search = value;
+                }
+            }
+            _ => return Err(format!("unknown argument: {arg}")),
+        }
+    }
+    Ok(cli)
+}
+
 /// What the window hands back when it closed because a game was launched.
 pub struct Launched {
     pub name: String,
@@ -57,6 +103,21 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
+    }
+
+    let cli = match parse_args(args.into_iter().skip(1)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rsgl: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(path) = cli.config {
+        if !path.is_file() {
+            eprintln!("rsgl: {}: config file not found", path.display());
+            std::process::exit(1);
+        }
+        config::set_config_path(path);
     }
 
     let (games, ui_cfg, api_cfg, pt_cfg, error) = match config::load() {
@@ -80,7 +141,7 @@ fn main() -> eframe::Result {
 
     let track = pt_cfg.enabled;
     let checkpoint = pt_cfg.checkpoint_minutes * 60;
-    let launched = ui::run(games, ui_cfg, api_cfg, pt_cfg, error)?;
+    let launched = ui::run(games, ui_cfg, api_cfg, pt_cfg, error, cli.fullscreen, cli.search)?;
 
     // The game keeps running in its own group. Replace this process with a fresh
     // copy that only waits for it, so the window's memory (GPU driver, textures,

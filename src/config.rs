@@ -3,7 +3,16 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
+
+/// Config file given with --config. When set, it replaces the default locations,
+/// and it also applies to F5 reloads, since those go through `load()` again.
+static CONFIG_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_config_path(path: PathBuf) {
+    let _ = CONFIG_OVERRIDE.set(path);
+}
 
 /// Written to the first config location when no config file exists yet.
 const EXAMPLE: &str = r#"# rsgl config
@@ -33,6 +42,7 @@ exec = "~/games/example/start.sh"
 # env = { SOME_VAR = "value" }
 # playtime = false                             # don't track this game
 # hidden = true                                # keep the entry but leave it out of the grid
+# tags = ["coop", "lan", "fps"]                # filter with t:coop in the search bar
 # steam_appid = 367520                         # pick covers by Steam app id instead of by name
 # steamgriddb_id = 1234                        # or by SteamGridDB game id
 "#;
@@ -109,6 +119,8 @@ struct GameCfg {
     playtime: bool,
     #[serde(default)]
     hidden: bool,
+    #[serde(default)]
+    tags: Vec<String>,
     steam_appid: Option<u64>,
     steamgriddb_id: Option<u64>,
 }
@@ -126,6 +138,8 @@ pub struct Game {
     pub env: HashMap<String, String>,
     /// Track playtime for this game (only if playtime is enabled globally too).
     pub playtime: bool,
+    /// Free-form labels, searched with `t:tag`.
+    pub tags: Vec<String>,
     /// Blurred hero (or cover) drawn behind the grid, filled in by the fetcher.
     pub background: Option<PathBuf>,
     /// Look the game up on SteamGridDB by this id instead of searching its name.
@@ -232,23 +246,33 @@ fn candidates() -> Vec<PathBuf> {
 /// Finds and parses the config. If no file exists, writes an example to the
 /// first location and returns an error telling the user about it.
 pub fn load() -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String> {
-    let candidates = candidates();
-
-    let Some(path) = candidates.iter().find(|p| p.is_file()) else {
-        let target = candidates
-            .first()
-            .ok_or("could not determine the home directory")?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let path: PathBuf = if let Some(p) = CONFIG_OVERRIDE.get() {
+        // an explicit path is never created for you
+        if !p.is_file() {
+            return Err(format!("{}: config file not found", p.display()));
         }
-        fs::write(target, EXAMPLE).map_err(|e| format!("{}: {e}", target.display()))?;
-        return Err(format!(
-            "No config found. Created an example at {}. Edit it and press F5.",
-            target.display()
-        ));
+        p.clone()
+    } else {
+        let candidates = candidates();
+        match candidates.iter().find(|p| p.is_file()) {
+            Some(p) => p.clone(),
+            None => {
+                let target = candidates
+                    .first()
+                    .ok_or("could not determine the home directory")?;
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                fs::write(target, EXAMPLE).map_err(|e| format!("{}: {e}", target.display()))?;
+                return Err(format!(
+                    "No config found. Created an example at {}. Edit it and press F5.",
+                    target.display()
+                ));
+            }
+        }
     };
 
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cfg: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
 
     let ui = cfg.ui;
@@ -274,6 +298,12 @@ pub fn load() -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String> {
                 workdir: g.workdir.map(|w| PathBuf::from(expand(&w))),
                 env: g.env.into_iter().map(|(k, v)| (k, expand(&v))).collect(),
                 playtime: g.playtime,
+                tags: g
+                    .tags
+                    .into_iter()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect(),
                 background: None,
                 // the SteamGridDB id is the more direct one if both are set
                 art_id: g
