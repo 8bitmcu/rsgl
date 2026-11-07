@@ -1,7 +1,7 @@
 use crate::{
     api,
-    config::{self, ApiCfg, Game, PlaytimeCfg, UiCfg},
-    launch, playtime, Launched,
+    config::{self, ApiCfg, Game, MenuAction, PlaytimeCfg, UiCfg},
+    launch, playtime, spawn, Launched,
 };
 use eframe::egui;
 use egui::{vec2, Align, Align2, Color32, FontId, Key, Modifiers, RichText, Stroke};
@@ -79,6 +79,8 @@ pub fn run(
                 bg_since: 0.0,
                 playtime,
                 launched,
+                menu: None,
+                swallow_click: false,
                 maximize: cfg.start_maximized && !fullscreen,
                 fullscreen,
             }))
@@ -106,8 +108,16 @@ fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) ->
 
 /// Opens `dir` in the file manager.
 fn open_folder(dir: &Path) {
-    let child = Command::new("xdg-open")
-        .arg(dir)
+    #[cfg(windows)]
+    let (program, target) = (
+        "explorer.exe",
+        std::ffi::OsString::from(dir.to_string_lossy().replace('/', "\\")),
+    );
+    #[cfg(not(windows))]
+    let (program, target) = ("xdg-open", dir.as_os_str().to_owned());
+
+    let child = Command::new(program)
+        .arg(&target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -116,7 +126,7 @@ fn open_folder(dir: &Path) {
         Ok(mut c) => {
             thread::spawn(move || c.wait()); // reap it so it doesn't linger as a zombie
         }
-        Err(e) => eprintln!("can't run xdg-open: {e}"),
+        Err(e) => eprintln!("can't run {program}: {e}"),
     }
 }
 
@@ -211,8 +221,17 @@ struct App {
     bg_since: f64,            // when `bg` last changed
     playtime: Option<playtime::Playtime>, // None when playtime is disabled
     launched: Rc<RefCell<Option<Launched>>>,
+    menu: Option<Menu>, // the open right-click menu
+    swallow_click: bool, // a click closed the menu, so it must not also launch the card under it
     maximize: bool, // send a maximize request on the first frame
     fullscreen: bool, // same for fullscreen (-f)
+}
+
+/// An open right-click menu.
+struct Menu {
+    game: usize,     // index into `games`
+    pos: egui::Pos2, // top-left corner
+    selected: usize, // highlighted entry
 }
 
 /// Splits a search into the name text and its `t:` tag filters, all lowercased:
@@ -263,8 +282,120 @@ impl App {
         // replacing rx drops the old receiver, which stops the old fetcher
         self.rx = fetch(ctx, &games, api.steamgriddb_key(), ui.blur);
         self.games = games;
+        self.menu = None;
         self.card_w = ui.card_width.clamp(80.0, 400.0);
         self.error = None;
+    }
+
+    /// Opens the right-click menu of game `game` at `pos`. A game with no menu entries
+    /// just opens its folder, which is what right-click did before menus existed.
+    fn open_menu(&mut self, ctx: &egui::Context, game: usize, pos: egui::Pos2) {
+        let g = &self.games[game];
+        if g.menu.is_empty() {
+            if let Some(dir) = &g.workdir {
+                open_folder(dir);
+            }
+        } else {
+            self.menu = Some(Menu { game, pos, selected: 0 });
+            ctx.request_repaint();
+        }
+    }
+
+    /// Shows `msg` in red above the grid (until the next F5 or failure) and prints it
+    /// to the terminal, so a launch that didn't happen isn't silent.
+    fn fail(&mut self, msg: String) {
+        eprintln!("rsgl: {msg}");
+        self.error = Some(msg);
+    }
+
+    /// Runs entry `k` of game `gi`'s menu. A tool runs in the background and rsgl stays
+    /// open; an entry with `launch = true` is an alternate way to start the game, so
+    /// rsgl closes and the playtime is tracked, like a normal launch.
+    fn run_entry(&mut self, ctx: &egui::Context, gi: usize, k: usize) {
+        let g = &self.games[gi];
+        let e = &g.menu[k];
+        match &e.action {
+            MenuAction::OpenFolder => {
+                if let Some(dir) = &e.workdir {
+                    open_folder(dir);
+                }
+            }
+            MenuAction::Exec(cmd) => match spawn(cmd, e.workdir.as_deref(), &e.env) {
+                Ok(child) if e.launch => {
+                    if g.playtime {
+                        *self.launched.borrow_mut() = Some(Launched { name: g.name.clone(), pgid: child.id() });
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // rsgl stays open, so reap the tool when it exits instead of leaving a zombie
+                Ok(mut child) => {
+                    thread::spawn(move || child.wait());
+                }
+                Err(err) => self.fail(format!("Couldn't run \"{}\": {err}", e.title)),
+            },
+        }
+    }
+
+    /// Draws the open menu on top of everything. Returns the entry picked with the
+    /// mouse, and whether this frame's press landed outside the menu.
+    fn show_menu(&mut self, ctx: &egui::Context, menu_open: bool) -> (Option<(usize, usize)>, bool) {
+        let Some(m) = &mut self.menu else { return (None, false) };
+        let game = &self.games[m.game];
+        let pointer_moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        let font = FontId::proportional(14.0);
+        let mut picked = None;
+
+        let area = egui::Area::new(egui::Id::new("game_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(m.pos)
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let galleys: Vec<_> = game
+                        .menu
+                        .iter()
+                        .map(|e| ui.painter().layout_no_wrap(e.title.clone(), font.clone(), Color32::PLACEHOLDER))
+                        .collect();
+                    let w = galleys.iter().map(|g| g.size().x).fold(160.0, f32::max) + 28.0;
+
+                    for (k, (e, galley)) in game.menu.iter().zip(galleys).enumerate() {
+                        // "open folder" with no workdir to open does nothing
+                        let usable = e.action != MenuAction::OpenFolder || e.workdir.is_some();
+                        let sense = if usable { egui::Sense::click() } else { egui::Sense::hover() };
+                        let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), sense);
+
+                        // hovering selects, but only when the mouse actually moves, so it
+                        // doesn't fight with the arrow keys
+                        if usable && resp.hovered() && pointer_moved {
+                            m.selected = k;
+                        }
+                        let on = k == m.selected;
+                        if on {
+                            ui.painter().rect_filled(rect, egui::CornerRadius::same(6), ACCENT.gamma_multiply(0.35));
+                        }
+                        let color = match (usable, on) {
+                            (false, _) => Color32::from_gray(90),
+                            (true, true) => Color32::WHITE,
+                            (true, false) => Color32::from_gray(210),
+                        };
+                        let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
+                        ui.painter().galley(pos, galley, color);
+
+                        if usable && resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            picked = Some((m.game, k));
+                        }
+                    }
+                });
+            });
+
+        let rect = area.response.rect;
+        let outside = menu_open
+            && ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p)));
+        (picked, outside)
     }
 
     /// Crossfades to `next` whenever it differs from the current background.
@@ -329,8 +460,39 @@ impl eframe::App for App {
             }
         }
 
+        // An open menu takes the keys: arrows move, Enter runs, Esc closes.
+        let menu_open = self.menu.is_some();
+        let mut chosen = None;
+        let mut close_menu = false;
+        if let Some(m) = &mut self.menu {
+            let count = self.games[m.game].menu.len();
+            let (up, down, enter, esc) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                )
+            });
+            if up {
+                m.selected = (m.selected + count - 1) % count;
+            }
+            if down {
+                m.selected = (m.selected + 1) % count;
+            }
+            if enter {
+                chosen = Some((m.game, m.selected));
+            }
+            close_menu = esc;
+        }
+        // a click that closed the menu is over once the button comes up
+        let swallow = self.swallow_click;
+        if ctx.input(|i| i.pointer.any_released()) {
+            self.swallow_click = false;
+        }
+
         // Esc clears the search first, then quits
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if !menu_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             if self.query.is_empty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
@@ -365,6 +527,11 @@ impl eframe::App for App {
         let gray = Color32::from_gray(140);
         let mut to_launch = None;
         let mut hovered = None;
+        let mut open_menu: Option<(usize, egui::Pos2)> = None;
+        let mut selected_rect = None;
+        // Shift+F10 opens the selected game's menu from the keyboard
+        let open_with_key =
+            !menu_open && !shown.is_empty() && ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F10));
 
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin::symmetric(20, 10)))
@@ -395,7 +562,8 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(egui::Margin::same(24))) // no fill, the background shows through
+            // no fill, the background shows through. No bottom margin, so the grid runs down to the status bar
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 24, right: 24, top: 24, bottom: 0 }))
             .show(ctx, |ui| {
                 if let Some(err) = &self.error {
                     ui.colored_label(Color32::LIGHT_RED, err);
@@ -406,7 +574,7 @@ impl eframe::App for App {
                 let cols = ((((ui.available_width() - 2.0 * PAD) + GAP) / (w + GAP)) as usize).max(1);
 
                 // Arrow keys are consumed so the text box doesn't move its cursor
-                if !shown.is_empty() {
+                if !shown.is_empty() && !menu_open {
                     let (l, r, u, d, pu, pd) = ctx.input_mut(|i| {
                         (
                             i.consume_key(Modifiers::NONE, Key::ArrowLeft),
@@ -448,14 +616,17 @@ impl eframe::App for App {
                 }
 
                 ui.vertical_centered(|ui| {
-                    ui.add(
+                    let search = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .hint_text("Search games or t:tag…   (arrows to move, Enter to launch, F5 to reload)")
                             .font(FontId::proportional(18.0))
                             .margin(egui::Margin::symmetric(14, 10))
-                            .desired_width(ui.available_width().min(SEARCH_MAX_W)),
-                    )
-                    .request_focus();
+                            .desired_width(ui.available_width().min(SEARCH_MAX_W))
+                            .interactive(!menu_open),
+                    );
+                    if !menu_open {
+                        search.request_focus();
+                    }
                 });
                 ui.add_space(20.0);
 
@@ -487,16 +658,20 @@ impl eframe::App for App {
                                 }
                                 let n = r * cols + c;
                                 let resp = card(ui, &self.games[i], w, n == selected, moved);
-                                if resp.clicked() {
+                                if n == selected {
+                                    selected_rect = Some(resp.rect);
+                                }
+                                // a click while a menu is open, or one that just closed it, is not a launch
+                                if resp.clicked() && !menu_open && !swallow {
                                     to_launch = Some(i);
                                 }
                                 if resp.secondary_clicked() {
-                                    if let Some(dir) = &self.games[i].workdir {
-                                        open_folder(dir);
-                                    }
+                                    open_menu = Some((i, resp.interact_pointer_pos().unwrap_or(resp.rect.center())));
+                                    hovered = Some(n);
                                 }
                                 // hovering selects, but only when the mouse actually moves
                                 if resp.hovered()
+                                    && !menu_open
                                     && ui.input(|inp| inp.pointer.delta() != egui::Vec2::ZERO)
                                 {
                                     hovered = Some(n);
@@ -513,10 +688,42 @@ impl eframe::App for App {
         }
         if let Some(i) = to_launch {
             let g = &self.games[i];
-            if let Some(pgid) = launch(g).filter(|_| g.playtime) {
-                *self.launched.borrow_mut() = Some(Launched { name: g.name.clone(), pgid });
+            match launch(g) {
+                Ok(pgid) => {
+                    if g.playtime {
+                        *self.launched.borrow_mut() = Some(Launched { name: g.name.clone(), pgid });
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // stay open, so the game can be fixed in the config and retried after F5
+                Err(err) => {
+                    let msg = format!("Couldn't start {}: {err}", g.name);
+                    self.fail(msg);
+                }
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // The menu is drawn last, on top of everything.
+        let (picked, outside) = self.show_menu(ctx, menu_open);
+        if outside {
+            close_menu = true;
+            // if the button is still down, its release must not launch the card under it
+            self.swallow_click = ctx.input(|i| i.pointer.primary_down());
+        }
+        if let Some((gi, k)) = picked.or(chosen) {
+            self.menu = None;
+            self.run_entry(ctx, gi, k);
+        } else if close_menu {
+            self.menu = None;
+        }
+
+        if open_with_key && open_menu.is_none() {
+            if let (Some(&i), Some(rect)) = (shown.get(self.selected), selected_rect) {
+                open_menu = Some((i, rect.center()));
+            }
+        }
+        if let Some((i, pos)) = open_menu {
+            self.open_menu(ctx, i, pos);
         }
     }
 }

@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI programs, so no console window opens next to the launcher.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod api;
 mod blur;
 mod config;
@@ -6,28 +9,88 @@ mod ui;
 
 use config::{ApiCfg, Game, PlaytimeCfg, UiCfg};
 use std::{
+    collections::HashMap,
     fs::{self, File},
-    os::unix::process::CommandExt,
+    io::IsTerminal,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::Duration,
 };
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
-/// Starts the game in its own process group and returns its pid (which is also the group id).
-fn launch(g: &Game) -> Option<u32> {
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The shell command that runs `exec`, in its own process group so the game
+/// outlives the launcher.
+#[cfg(unix)]
+fn shell_command(exec: &str) -> Command {
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(format!("exec {}", g.exec));
-    if let Some(dir) = &g.workdir {
+    cmd.arg("-c").arg(format!("exec {exec}")).process_group(0);
+    cmd
+}
+
+/// On Windows `exec` goes through `cmd /C`. `/S` makes cmd strip exactly one pair of
+/// outer quotes, so quoted paths inside `exec` survive.
+#[cfg(windows)]
+fn shell_command(exec: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.raw_arg(format!("/S /C \"{exec}\""))
+        .creation_flags(CREATE_NEW_PROCESS_GROUP);
+    cmd
+}
+
+/// True when rsgl was started from a terminal (or with its output redirected from
+/// one), as opposed to a desktop entry or a hotkey, which have no terminal at all.
+fn from_terminal() -> bool {
+    std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal()
+}
+
+/// Starts `exec` through the shell, detached from rsgl: in `workdir` and with `env`
+/// added to our own environment. Used for games and for right-click menu entries.
+///
+/// When rsgl was started from a terminal, the program writes to that terminal too,
+/// even after the launcher window has closed. Otherwise its output is discarded.
+/// Stdin is never passed on: the program is in the background and the terminal
+/// would stop it the moment it tried to read.
+///
+/// The error says why it couldn't start. Only problems that show up while starting
+/// are caught: a command the shell can't find fails after this has already returned.
+fn spawn(exec: &str, workdir: Option<&Path>, env: &HashMap<String, String>) -> Result<Child, String> {
+    let mut cmd = shell_command(exec);
+    if let Some(dir) = workdir {
+        // checked here so the message can name the folder; the OS error alone doesn't
+        if !dir.is_dir() {
+            return Err(format!("the workdir {} doesn't exist", dir.display()));
+        }
         cmd.current_dir(dir);
     }
-    cmd.envs(&g.env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0) // detach so the game outlives the launcher
-        .spawn()
-        .ok()
-        .map(|c| c.id())
+    cmd.envs(env).stdin(Stdio::null());
+    if from_terminal() {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        // no console either, so one doesn't sit behind the game (its own window is unaffected)
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
+    }
+    cmd.spawn().map_err(|e| e.to_string())
+}
+
+/// Starts the game and returns its pid (on Unix also its process group id).
+fn launch(g: &Game) -> Result<u32, String> {
+    spawn(&g.exec, g.workdir.as_deref(), &g.env).map(|c| c.id())
 }
 
 /// Takes an exclusive lock on `path`, held until the returned file is dropped
@@ -49,16 +112,39 @@ Options:
   -f, --fullscreen     Start fullscreen
   -s, --search <TEXT>  Start with TEXT in the search bar (t:tag filters by tag)
   -h, --help           Show this help
+
+Commands that run without opening the window (use one):
+      --launch <GAME>  Start GAME
+      --list           Print the names of all games
+      --show <GAME>    Print how GAME will run (exec, workdir, env, menu)
+      --check          Check the whole config, hidden games included
 ";
+
+/// A command that runs without opening the window.
+#[derive(Debug, PartialEq)]
+enum Action {
+    Launch(String),
+    List,
+    Show(String),
+    Check,
+}
 
 struct Cli {
     fullscreen: bool,
     config: Option<PathBuf>,
     search: String,
+    action: Option<Action>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
-    let mut cli = Cli { fullscreen: false, config: None, search: String::new() };
+    let mut cli = Cli { fullscreen: false, config: None, search: String::new(), action: None };
+    let set_action = |cli: &mut Cli, action: Action| match cli.action {
+        None => {
+            cli.action = Some(action);
+            Ok(())
+        }
+        Some(_) => Err("use only one of --launch, --list, --show and --check".to_string()),
+    };
     while let Some(arg) = args.next() {
         // `--flag=value` is the same as `--flag value`
         let (flag, inline) = match arg.split_once('=') {
@@ -71,14 +157,17 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
-            "-c" | "--config" | "-s" | "--search" => {
+            "--list" if inline.is_none() => set_action(&mut cli, Action::List)?,
+            "--check" if inline.is_none() => set_action(&mut cli, Action::Check)?,
+            "-c" | "--config" | "-s" | "--search" | "--show" | "--launch" => {
                 let value = inline
                     .or_else(|| args.next())
                     .ok_or_else(|| format!("{flag} needs an argument"))?;
-                if flag == "-c" || flag == "--config" {
-                    cli.config = Some(PathBuf::from(config::expand(&value)));
-                } else {
-                    cli.search = value;
+                match flag {
+                    "-c" | "--config" => cli.config = Some(PathBuf::from(config::expand(&value))),
+                    "-s" | "--search" => cli.search = value,
+                    "--show" => set_action(&mut cli, Action::Show(value))?,
+                    _ => set_action(&mut cli, Action::Launch(value))?,
                 }
             }
             _ => return Err(format!("unknown argument: {arg}")),
@@ -93,7 +182,150 @@ pub struct Launched {
     pub pgid: u32,
 }
 
+/// A GUI-subsystem program has no console of its own, so hook up to the one it was
+/// started from. That keeps --help, error messages and the game's output visible in
+/// a terminal. Streams the parent redirected (`> file`) are left alone.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::{ffi::c_void, fs::OpenOptions, os::windows::io::IntoRawHandle};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+
+    unsafe {
+        if AttachConsole(u32::MAX) == 0 {
+            return; // no parent console, e.g. started from Explorer
+        }
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = GetStdHandle(which);
+            // attaching doesn't hand a GUI program its std handles, so open them here
+            if handle.is_null() || handle as isize == -1 {
+                if let Ok(console) = OpenOptions::new().write(true).open("CONOUT$") {
+                    SetStdHandle(which, console.into_raw_handle());
+                }
+            }
+        }
+    }
+}
+
+/// The game keeps running in its own group. Replace this process with a fresh
+/// copy that only waits for it, so the window's memory (GPU driver, textures,
+/// decoded images) is given back instead of sitting around until the game exits.
+/// exec keeps our pid, so the game stays our child and can still be reaped.
+#[cfg(unix)]
+fn start_tracker(l: &Launched, checkpoint: u64) {
+    let err = Command::new("/proc/self/exe")
+        .arg0("rsgl")
+        .args(["--track", &l.pgid.to_string(), &checkpoint.to_string(), &l.name])
+        .exec();
+    eprintln!("rsgl: can't start playtime tracking: {err}");
+}
+
+/// Windows has no exec, so start the waiting copy as a detached process and let
+/// this one exit, which frees the window's memory just the same.
+#[cfg(windows)]
+fn start_tracker(l: &Launched, checkpoint: u64) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return eprintln!("rsgl: can't start playtime tracking: {e}"),
+    };
+    let child = Command::new(exe)
+        .args(["--track", &l.pgid.to_string(), &checkpoint.to_string(), &l.name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn();
+    if let Err(e) = child {
+        eprintln!("rsgl: can't start playtime tracking: {e}");
+    }
+}
+
+/// Runs a command-line action and returns the exit code.
+fn run_action(action: Action) -> i32 {
+    let fail = |msg: String| {
+        eprintln!("rsgl: {msg}");
+        1
+    };
+    if action == Action::Check {
+        return run_check();
+    }
+    let (games, _ui, _api, pt) = match config::load_existing() {
+        Ok(loaded) => loaded,
+        Err(e) => return fail(e),
+    };
+
+    match action {
+        Action::Check => unreachable!("handled above"),
+        Action::List => {
+            for g in &games {
+                println!("{}", g.name);
+            }
+            0
+        }
+        Action::Show(query) => match config::find(&games, &query) {
+            Ok(g) => {
+                print!("{}", config::describe(g));
+                0
+            }
+            Err(e) => fail(e),
+        },
+        Action::Launch(query) => {
+            let game = match config::find(&games, &query) {
+                Ok(g) => g,
+                Err(e) => return fail(e),
+            };
+            match launch(game) {
+                Ok(pgid) => {
+                    // like a launch from the window: with playtime on, a small copy of rsgl
+                    // stays behind to time the game (on Unix this replaces this process)
+                    if pt.enabled && game.playtime {
+                        let l = Launched { name: game.name.clone(), pgid };
+                        start_tracker(&l, pt.checkpoint_minutes * 60);
+                    }
+                    0
+                }
+                Err(e) => fail(format!("couldn't start {}: {e}", game.name)),
+            }
+        }
+    }
+}
+
+/// `--check`: prints what's wrong with the config. Only errors make the exit code non-zero.
+fn run_check() -> i32 {
+    const SHOWN: usize = 20;
+    let report = match config::check() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("rsgl: {e}");
+            return 1;
+        }
+    };
+    println!("checked {}: {} games ({} hidden)", report.path.display(), report.games, report.hidden);
+    for e in report.errors.iter().take(SHOWN) {
+        println!("error: {e}");
+    }
+    if report.errors.len() > SHOWN {
+        println!("... and {} more errors", report.errors.len() - SHOWN);
+    }
+    for w in &report.warnings {
+        println!("warning: {w}");
+    }
+    let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    println!("{}, {}", count(report.errors.len(), "error"), count(report.warnings.len(), "warning"));
+    i32::from(!report.errors.is_empty())
+}
+
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    attach_parent_console();
+
     let args: Vec<String> = std::env::args().collect();
     // internal: `rsgl --track <pgid> <checkpoint secs> <name>`, see below
     if let [_, flag, pgid, secs, name] = &args[..] {
@@ -112,12 +344,18 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
-    if let Some(path) = cli.config {
+    let Cli { fullscreen, config: config_path, search, action } = cli;
+    if let Some(path) = config_path {
         if !path.is_file() {
             eprintln!("rsgl: {}: config file not found", path.display());
             std::process::exit(1);
         }
         config::set_config_path(path);
+    }
+
+    // no window, no single-instance lock, and no example config written
+    if let Some(action) = action {
+        std::process::exit(run_action(action));
     }
 
     let (games, ui_cfg, api_cfg, pt_cfg, error) = match config::load() {
@@ -141,18 +379,51 @@ fn main() -> eframe::Result {
 
     let track = pt_cfg.enabled;
     let checkpoint = pt_cfg.checkpoint_minutes * 60;
-    let launched = ui::run(games, ui_cfg, api_cfg, pt_cfg, error, cli.fullscreen, cli.search)?;
+    let launched = ui::run(games, ui_cfg, api_cfg, pt_cfg, error, fullscreen, search)?;
 
-    // The game keeps running in its own group. Replace this process with a fresh
-    // copy that only waits for it, so the window's memory (GPU driver, textures,
-    // decoded images) is given back instead of sitting around until the game exits.
-    // exec keeps our pid, so the game stays our child and can still be reaped.
     if let Some(l) = launched.filter(|_| track) {
-        let err = Command::new("/proc/self/exe")
-            .arg0("rsgl")
-            .args(["--track", &l.pgid.to_string(), &checkpoint.to_string(), &l.name])
-            .exec();
-        eprintln!("rsgl: can't start playtime tracking: {err}");
+        start_tracker(&l, checkpoint);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn actions_and_their_arguments() {
+        assert_eq!(parse(&["--list"]).unwrap().action, Some(Action::List));
+        assert_eq!(parse(&["--check"]).unwrap().action, Some(Action::Check));
+        assert_eq!(parse(&["--show", "Quake"]).unwrap().action, Some(Action::Show("Quake".into())));
+        assert_eq!(parse(&["--launch=Left 4 Dead 2"]).unwrap().action, Some(Action::Launch("Left 4 Dead 2".into())));
+        assert_eq!(parse(&[]).unwrap().action, None);
+    }
+
+    #[test]
+    fn only_one_action_at_a_time() {
+        let e = parse(&["--list", "--check"]).err().unwrap();
+        assert!(e.contains("only one of"), "{e}");
+        assert!(parse(&["--show", "A", "--launch", "B"]).is_err());
+    }
+
+    #[test]
+    fn bad_arguments_are_errors() {
+        assert!(parse(&["--launch"]).err().unwrap().contains("needs an argument"));
+        assert!(parse(&["--list=1"]).err().unwrap().contains("unknown argument"));
+        assert!(parse(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn options_still_work_alongside_actions() {
+        let cli = parse(&["-f", "-s", "t:coop", "--config=/x.toml", "--list"]).unwrap();
+        assert!(cli.fullscreen);
+        assert_eq!(cli.search, "t:coop");
+        assert_eq!(cli.config, Some(PathBuf::from("/x.toml")));
+        assert_eq!(cli.action, Some(Action::List));
+    }
 }

@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::thread;
 
 /// How often the tracker checks whether the game is still running.
 const POLL: Duration = Duration::from_secs(2);
@@ -52,6 +53,7 @@ fn add(name: &str, played: Duration) -> Result<(), String> {
 
 /// True while any process in the group is alive. Reaps our own exited children
 /// first, since a zombie still counts as a member of the group.
+#[cfg(unix)]
 fn group_alive(pgid: i32) -> bool {
     let alive = unsafe {
         while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
@@ -60,14 +62,50 @@ fn group_alive(pgid: i32) -> bool {
     alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Waits until the game's process group is empty, saving the time played every
-/// `checkpoint` (if non-zero) and once more at the end.
-pub fn track(pgid: i32, name: &str, checkpoint: Duration) {
+/// Waits up to `wait`, then reports whether the game has finished.
+#[cfg(unix)]
+fn wait_finished(pgid: u32, wait: Duration) -> bool {
+    thread::sleep(wait);
+    !group_alive(pgid as i32)
+}
+
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        pub fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        pub fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+}
+
+/// Waits up to `wait` for the process to exit and reports whether it has. Windows
+/// has no process groups, so this follows the one process we started (the `cmd`
+/// wrapper), which itself waits for the game.
+#[cfg(windows)]
+fn wait_finished(pid: u32, wait: Duration) -> bool {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    unsafe {
+        let handle = win::OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return true; // already gone
+        }
+        let result = win::WaitForSingleObject(handle, wait.as_millis() as u32);
+        win::CloseHandle(handle);
+        result != WAIT_TIMEOUT
+    }
+}
+
+/// Waits until the game has finished (on Unix, until its process group is empty),
+/// saving the time played every `checkpoint` (if non-zero) and once more at the end.
+pub fn track(pgid: u32, name: &str, checkpoint: Duration) {
     // Instant doesn't advance while the machine is suspended, so sleep isn't counted
     let mut last = Instant::now();
     loop {
-        thread::sleep(POLL);
-        let alive = group_alive(pgid);
+        let alive = !wait_finished(pgid, POLL);
         let now = Instant::now();
         if !alive || (!checkpoint.is_zero() && now - last >= checkpoint) {
             // only move `last` forward by whole seconds, so no time is lost to rounding

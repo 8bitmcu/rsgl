@@ -58,8 +58,48 @@ jobs:
             rsgl-*.tar.gz
             rsgl-*.sha256
 
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "rsgl-$env:GITHUB_REF_NAME-windows-x86_64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/rsgl.exe $name/
+          if (Test-Path README.md) { Copy-Item README.md $name/ }
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsgl-windows-x86_64
+          path: |
+            rsgl-*.zip
+            rsgl-*.sha256
+
   release:
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -71,5 +111,6 @@ jobs:
         with:
           files: |
             rsgl-*.tar.gz
+            rsgl-*.zip
             rsgl-*.sha256
           generate_release_notes: true

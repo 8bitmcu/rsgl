@@ -1,8 +1,9 @@
 # rsgl
 
-A small, keyboard-driven game launcher for Linux. You list your games in a TOML
-file, and rsgl shows them as a grid of cover art. Type to filter, pick one with
-the arrow keys, hit Enter, and the launcher starts the game and closes.
+A small, keyboard-driven game launcher for Linux and Windows. You list your
+games in a TOML file, and rsgl shows them as a grid of cover art. Type to
+filter, pick one with the arrow keys, hit Enter, and the launcher starts the
+game and closes.
 
 If you give it a [SteamGridDB](https://www.steamgriddb.com/) API key, it
 downloads missing covers and hero images for you, then draws a blurred version
@@ -14,7 +15,11 @@ of the selected game's art behind the grid.
 ## Features
 
 - Cover-art grid with search-as-you-type filtering
+- Variables (`{name}`) and a global `[env]`, so paths, launch commands and
+  environment settings aren't repeated in the config
+- Command-line `--launch`, `--list`, `--show` and `--check`, for hotkeys and scripts
 - Tags, with `t:tag` filtering in the search bar
+- Configurable right-click menu per game: tools, or alternate ways to launch
 - Full keyboard control, mouse works too
 - Automatic cover and hero downloads from SteamGridDB (optional)
 - Blurred, crossfading background for the selected game
@@ -34,14 +39,16 @@ cargo build --release
 ./target/release/rsgl
 ```
 
-rsgl uses `eframe`/`egui` with OpenGL and supports both Wayland and X11. It
-only builds on Unix, since it detaches games with Unix process groups.
+rsgl uses `eframe`/`egui` with OpenGL. On Linux it supports both Wayland and
+X11. On Windows it builds with the normal MSVC toolchain (`x86_64-pc-windows-msvc`);
+see [Windows](#windows) for the differences.
 
 ## Configuration
 
 rsgl reads the first of these files that exists:
 
-1. `$XDG_CONFIG_HOME/rsgl/rsgl.toml` (usually `~/.config/rsgl/rsgl.toml`)
+1. `$XDG_CONFIG_HOME/rsgl/rsgl.toml` (usually `~/.config/rsgl/rsgl.toml`;
+   on Windows `%APPDATA%\rsgl\rsgl.toml`)
 2. `~/.rsgl.toml`
 
 Pass `-c <file>` to use a different file instead (see [Command line](#command-line)).
@@ -69,6 +76,9 @@ checkpoint_minutes = 5   # save a running session every N minutes, 0 = only on e
 [api]
 steamgriddb_key = "your-key-here"
 
+[env]
+WINEDEBUG = "-all"       # set for every game; a game's own env wins
+
 [[game]]
 name = "Example Game"
 exec = "~/games/example/start.sh"
@@ -84,7 +94,14 @@ steamgriddb_id = 1234                        # optional, find art by SteamGridDB
 
 Notes on `[[game]]` entries:
 
-- `exec` runs through `sh -c`, so arguments, quoting and pipes all work.
+- `exec` runs through `sh -c` (`cmd /C` on Windows), so arguments, quoting and
+  pipes all work.
+- If a game can't be started (for example its `workdir` doesn't exist), rsgl
+  stays open and shows the reason in red above the grid until you press F5, and
+  prints it to the terminal. A command the shell can't find is only noticed
+  after the shell has already started, so that case still closes rsgl; start
+  rsgl from a terminal to see the shell's message (see [Game output](#game-output)).
+  Menu entries report failures the same way.
 - A leading `~` is expanded in `exec`, `cover`, `workdir` and `env` values.
 - Games are sorted by name (case-insensitive), not by their order in the file.
 - If `cover` is missing or doesn't exist, rsgl looks in the covers cache (see
@@ -95,7 +112,154 @@ Notes on `[[game]]` entries:
   `steamgriddb_id` wins. Adding or changing an id re-downloads the cached cover
   and hero once, replacing what's in the cache.
 - `hidden = true` hides a game without deleting its entry.
+- `{name}` placeholders in `exec`, `workdir`, `cover` and `env` are filled in from
+  `[vars]`, see [Variables](#variables).
 - `tags` is a list of labels for the game, see [Tags](#tags).
+- `[[game.right_click]]` adds right-click menu entries, see
+  [Right-click menu](#right-click-menu).
+
+### Right-click menu
+
+Right-click a game (or press Shift+F10 on the selected one) to get a menu you
+define yourself. Each entry is either a **tool** for the game (open its config,
+run a setup program) or an **alternate launch** (windowed, with mods, ...).
+
+```toml
+# shown for every game, before the game's own entries
+[[right_click]]
+title = "Open game folder"
+action = "open_folder"
+
+[[game]]
+name = "Quake"
+exec = "~/games/quake/start.sh"
+workdir = "~/games/quake"
+env = { SDL_VIDEODRIVER = "x11" }
+tags = ["fps"]            # the game's own keys go above its menu entries
+
+[[game.right_click]]
+title = "Play (windowed)"
+exec = "./start.sh -windowed"
+launch = true             # an alternate launch, see below
+
+[[game.right_click]]
+title = "Edit config"
+exec = "xdg-open ~/.config/quake/config.cfg"
+workdir = "~"
+env = { EDITOR = "kate" }
+```
+
+| Key       | Meaning                                                                          |
+| --------- | -------------------------------------------------------------------------------- |
+| `title`   | Text shown in the menu. Required.                                                |
+| `exec`    | Command to run, like a game's `exec`. Needs `exec` or `action`, not both.        |
+| `action`  | A built-in instead of `exec`. The only one is `"open_folder"`: open the workdir. |
+| `workdir` | Optional. Defaults to the game's `workdir`.                                      |
+| `env`     | Optional. Added to the game's `env`; the entry wins if both set a variable.      |
+| `launch`  | Optional, default `false`. See below.                                            |
+
+- **Tools** (`launch = false`) run in the background and rsgl stays open. They
+  don't count toward playtime.
+- **Alternate launches** (`launch = true`) behave like pressing Enter on the
+  game: rsgl closes and the playtime is tracked for that game (unless playtime
+  is off, globally or for the game).
+- Entries run exactly like a game's `exec`: through the shell, with `~`
+  expanded, and printing to your terminal if you started rsgl from one.
+- A top-level `[[right_click]]` applies to every game and comes first, then the
+  game's own entries. A game with no entries at all just opens its `workdir`
+  when you right-click it. Otherwise the menu always opens, even for one entry.
+- `action = "open_folder"` is greyed out when there's no `workdir` to open, and
+  works the same on Windows, where `xdg-open` doesn't exist.
+- Every key below a `[[game.right_click]]` header belongs to that entry, so put
+  the game's own keys (`tags`, `hidden`, ...) above it. A key in the wrong place
+  is reported as an error instead of being ignored.
+- In the menu: arrows move, Enter runs, Esc closes. Clicking outside closes it
+  without launching the game under the pointer.
+
+### Game output
+
+If you start rsgl from a terminal, the game's stdout and stderr go to that
+terminal too, even after the launcher window has closed. That makes it easy to
+see why a game won't start. If rsgl was started some other way (a desktop
+entry, a hotkey), the output is discarded as before.
+
+- The game's stdin is never connected, since the game runs in the background
+  and the terminal would stop it as soon as it tried to read.
+- Ctrl-C in the terminal stops rsgl (and its playtime tracking), not the game,
+  because the game runs in its own process group.
+- With playtime tracking on, the shell prompt doesn't come back until the game
+  exits, since rsgl stays running to time it.
+
+### Variables
+
+Put values you repeat in a `[vars]` table and use them as `{name}`:
+
+```toml
+[vars]
+games = "~/.wine/drive_c/games"
+w = 3440
+h = 1440
+gs = "gamescope -w {w} -h {h} -f --"
+
+[[game]]
+name = "FlatOut 2"
+exec = "{gs} wine FlatOut2.exe"
+workdir = "{games}/FlatOut2"
+
+[[game]]
+name = "Command & Conquer 3: Tiberium Wars"
+vars = { w = 2560 }              # {gs} now means 2560x1440 for this game only
+exec = "{gs} wine CNC3.exe"
+workdir = "{games}/CommandConquer3TiberiumWars"
+```
+
+- **Where they apply:** `exec`, `workdir`, `cover` and `env` values, and the same
+  fields of right-click menu entries. Not `name`, `tags` or a menu `title`.
+- **Overrides:** a game's own `vars` win over `[vars]`. A variable can use other
+  variables, and they're looked up after the two tables are merged, so the
+  game's `w = 2560` above reaches the `{w}` inside `gs`.
+- **Menu entries** see the variables of the game they're shown for. A shared
+  `[[right_click]]` entry can use a per-game variable like `{dir}`, but then
+  every game must define it.
+- **Values** can be strings, numbers or booleans. Arrays and tables aren't
+  allowed.
+- **Literal braces:** write `{{` and `}}`, for example `awk '{{print $1}}'`.
+- **Mistakes are errors**, shown in the red line on F5 with the game and field:
+  an undefined `{name}`, variables that use each other in a circle, a stray or
+  unclosed brace. Hidden games aren't checked.
+- **Order:** variables are filled in first, then a leading `~` is expanded, so
+  `games = "~/..."` works in `workdir`.
+- Variables only exist inside the config. They aren't passed to the game as
+  environment variables; use `env` for that.
+- rsgl starts every game in its `workdir`, so `exec` can use paths relative to
+  it (`wine FlatOut2.exe`, `./UT2004`) instead of repeating the full path.
+
+To see what a game will actually run after all the substitution, use
+[`--show`](#command-line).
+
+### Environment
+
+A top-level `[env]` table sets environment variables for every game and every
+menu entry, so settings like wine's don't have to be repeated:
+
+```toml
+[env]
+WINEDEBUG = "-all"
+WINEPREFIX = "{prefix}/{dir}"
+
+[[game]]
+name = "Quake"
+exec = "wine quake.exe"
+vars = { dir = "quake" }
+env = { WINEDEBUG = "err+all" }   # this game's own value wins
+```
+
+- A game's own `env` wins per variable, and a menu entry's `env` wins over both.
+- Values can use `{variables}` (the game's own, so a global value that uses
+  `{dir}` needs every game to define it) and a leading `~` is expanded.
+- Values must be strings, and there's no way to *unset* a global variable for one
+  game; set it to `""` to blank it.
+- `--show` prints the merged result.
 
 ### Tags
 
@@ -148,6 +312,33 @@ right away and the game runs outside our process group. Direct executables and
 normal wrapper scripts are fine. Set `playtime = false` on those games so they
 don't log a few seconds each launch.
 
+### Windows
+
+Everything works the same on Windows apart from the points below.
+
+- **Paths in TOML:** use single quotes so backslashes aren't treated as escapes,
+  for example `exec = '"C:\Games\My Game\game.exe" -windowed'`. Forward slashes
+  in `cover` and `workdir` are fine.
+- **`exec`:** it runs as `cmd /S /C "<exec>"`. Quote any path that contains
+  spaces. A leading `~` (or `~\`) is expanded to your user folder, but without
+  quotes, so use a full quoted path if your user name has a space in it.
+- **Console window:** when rsgl is started from a terminal, games share it and
+  print there (see [Game output](#game-output)). Otherwise they start with
+  their console hidden, so windowed games are unaffected but a terminal
+  program will run invisibly.
+- **Playtime:** Windows has no process groups, so rsgl follows the one process
+  it started (the `cmd` wrapper), which waits for the game to exit. Games that
+  start something else and quit right away (launchers, `start`, Steam URLs) are
+  not tracked properly, so set `playtime = false` on those. When you launch a
+  game, rsgl starts a tiny hidden copy of itself to do the waiting and the
+  window process exits.
+- **Folders:** the config is in `%APPDATA%\rsgl`, the cache in
+  `%LOCALAPPDATA%\rsgl` and the playtime file in `%APPDATA%\rsgl\playtime.toml`.
+  A menu's `open_folder` action opens the game's folder in Explorer.
+- **Terminal output:** release builds are GUI programs. Run from `cmd` or
+  PowerShell they print `--help`, errors and the game's output to that terminal,
+  but the prompt comes back immediately instead of waiting for rsgl to close.
+
 ### Single instance
 
 With `single_instance = true` (the default), starting rsgl while its window is
@@ -171,6 +362,12 @@ Options:
   -f, --fullscreen     Start fullscreen
   -s, --search <TEXT>  Start with TEXT in the search bar (t:tag filters by tag)
   -h, --help           Show this help
+
+Commands that run without opening the window (use one):
+      --launch <GAME>  Start GAME
+      --list           Print the names of all games
+      --show <GAME>    Print how GAME will run (exec, workdir, env, menu)
+      --check          Check the whole config, hidden games included
 ```
 
 - `--config` replaces the default lookup rather than going first. The file has
@@ -178,24 +375,46 @@ Options:
   config to a path you gave it. F5 reloads the same file. `--config=FILE` works
   too, and a leading `~` is expanded.
 - `--fullscreen` wins over `start_maximized`.
+- The four commands (`--launch`, `--list`, `--show`, `--check`) run without a
+  window, don't take the single-instance lock, and never write an example
+  config: if there's no config they just say so. Use only one at a time, with
+  `--config` if you like. They exit with 0 on success and 1 on failure.
+- `--launch GAME` starts a game from a hotkey or a script, just like pressing
+  Enter on it. With playtime on, rsgl stays running in the background until the
+  game exits, to time it. If the game can't start, it says why and exits 1.
+- `--list` prints the name of every game, one per line, in the order the grid
+  shows them. For example, with rofi:
+  `rsgl --list | rofi -dmenu | xargs -d '\n' -r rsgl --launch`.
+- `--show GAME` prints the game's resolved `exec`, `workdir`, `env` and menu
+  entries, with every variable filled in. For `--launch` and `--show`, GAME can
+  be an exact name (any case) or part of a name if only one game contains it.
+- Hidden games aren't loaded, so `--list`, `--show` and `--launch` don't see them.
+  `--check` does look at them.
+- `--check` reads the whole config and reports every problem instead of stopping
+  at the first: an **error** is something that stops a game loading (an undefined
+  `{variable}`, a bad menu entry, a key under the wrong header), and a
+  **warning** is something that loads but looks wrong (a `workdir` that doesn't
+  exist, two games with the same name, which share a playtime total). Only
+  errors make the exit code 1. It checks files and folders on this machine, so
+  warnings about a drive that isn't mounted are normal.
 - `--search` fills in the search bar and applies it right away, for example
   `rsgl -s "t:coop"`. Esc clears it like any other search.
 
 ## Controls
 
-| Key           | Action                                        |
-| ------------- | --------------------------------------------- |
-| Type          | Filter games by name, or `t:tag` by tag       |
-| Arrow keys    | Move the selection                            |
-| PageUp/Down   | Move the selection a screen up or down        |
-| Enter / click | Launch the selected game and close rsgl       |
-| Right-click   | Open the game's `workdir` in the file manager |
-| F5            | Reload the config                             |
-| Esc           | Clear the search, or quit if it's empty       |
+| Key                     | Action                                                                           |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| Type                    | Filter games by name, or `t:tag` by tag                                          |
+| Arrow keys              | Move the selection                                                               |
+| PageUp/Down             | Move the selection a screen up or down                                           |
+| Enter / click           | Launch the selected game and close rsgl                                          |
+| Right-click / Shift+F10 | Open the game's [menu](#right-click-menu), or its `workdir` if it has no entries |
+| F5                      | Reload the config                                                                |
+| Esc                     | Clear the search, or quit if it's empty (closes an open menu first)              |
 
 ## Cache
 
-Downloaded and generated images live under `~/.cache/rsgl`:
+Downloaded and generated images live under `~/.cache/rsgl` (`%LOCALAPPDATA%\rsgl` on Windows):
 
 - `covers/` — cover art, named `<slug>.png|jpg|webp`
 - `heroes/` — wide hero images used for backgrounds
