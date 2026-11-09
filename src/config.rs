@@ -1,3 +1,4 @@
+use crate::{gamepad::Padmap, keys::Keymap};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -34,6 +35,37 @@ checkpoint_minutes = 5
 [api]
 # steamgriddb_key = "your-key-here"
 
+# Keys for each action. An action you leave out keeps its default (shown here);
+# an empty list unbinds it. Modifiers are Ctrl, Alt and Shift. Letters, digits,
+# punctuation, Space, Backspace and Delete need Ctrl or Alt, since the search box uses them.
+# [keyboard]
+# up = ["Up"]
+# down = ["Down"]
+# left = ["Left"]
+# right = ["Right"]
+# page_up = ["PageUp"]
+# page_down = ["PageDown"]
+# launch = ["Enter"]                           # also runs the highlighted menu entry
+# menu = ["Shift+F10"]                         # open the selected game's right-click menu
+# back = ["Escape"]                            # close the menu, clear the search, then quit
+# reload = ["F5"]
+
+# Gamepad buttons for each action, same rules as [keyboard]. Buttons are named
+# after the Xbox layout and matched by position (A is the bottom face button on
+# any pad): A B X Y LB RB LT RT View Menu Guide LS RS DPadUp DPadDown DPadLeft
+# DPadRight, plus LeftStickUp/Down/Left/Right for tilting the left stick.
+# [gamepad]
+# up = ["DPadUp", "LeftStickUp"]
+# down = ["DPadDown", "LeftStickDown"]
+# left = ["DPadLeft", "LeftStickLeft"]
+# right = ["DPadRight", "LeftStickRight"]
+# page_up = ["LB"]
+# page_down = ["RB"]
+# launch = ["A"]
+# menu = ["Menu"]
+# back = ["B"]
+# reload = ["View"]
+
 # Variables: {name} is replaced in exec, workdir, cover and env values (and in
 # menu entries). A game's own `vars` override these, and a variable can use
 # others, e.g. gs = "gamescope -w {w} -h {h} -f --". Write {{ for a literal brace.
@@ -61,6 +93,8 @@ exec = "~/games/example/start.sh"
 # tags = ["coop", "lan", "fps"]                # filter with t:coop in the search bar
 # steam_appid = 367520                         # pick covers by Steam app id instead of by name
 # steamgriddb_id = 1234                        # or by SteamGridDB game id
+# grid_id = 664940                             # use this SteamGridDB grid as the cover
+# hero_id = 15208                              # and this hero for the background
 # vars = { dir = "example" }                   # this game's variables, see [vars]
 
 # Menu entries must come after the game's other keys, since every key below a
@@ -86,6 +120,10 @@ struct Config {
     #[serde(default)]
     playtime: PlaytimeCfg,
     #[serde(default)]
+    keyboard: Keymap,
+    #[serde(default)]
+    gamepad: Padmap,
+    #[serde(default)]
     vars: BTreeMap<String, toml::Value>,
     #[serde(default)]
     env: BTreeMap<String, String>,
@@ -93,6 +131,17 @@ struct Config {
     right_click: Vec<MenuCfg>,
     #[serde(default, rename = "game")]
     games: Vec<GameCfg>,
+}
+
+/// Everything the window needs from the config file.
+#[derive(Default)]
+pub struct Settings {
+    pub games: Vec<Game>,
+    pub ui: UiCfg,
+    pub api: ApiCfg,
+    pub playtime: PlaytimeCfg,
+    pub keyboard: Keymap,
+    pub gamepad: Padmap,
 }
 
 #[derive(Deserialize, Default)]
@@ -159,6 +208,8 @@ struct GameCfg {
     tags: Vec<String>,
     steam_appid: Option<u64>,
     steamgriddb_id: Option<u64>,
+    grid_id: Option<u64>,
+    hero_id: Option<u64>,
     #[serde(default)]
     vars: BTreeMap<String, toml::Value>,
     #[serde(default)]
@@ -221,6 +272,19 @@ pub struct Game {
     pub background: Option<PathBuf>,
     /// Look the game up on SteamGridDB by this id instead of searching its name.
     pub art_id: Option<ArtId>,
+    /// SteamGridDB grid to use as the cover instead of the best-scored one.
+    pub grid_id: Option<u64>,
+    /// SteamGridDB hero to use for the background instead of the best-scored one.
+    pub hero_id: Option<u64>,
+}
+
+impl Game {
+    /// False when the game's workdir is set but doesn't exist, which usually means the
+    /// game isn't installed (or was uninstalled). A game without a workdir counts as
+    /// installed, since there's nothing to check.
+    pub fn installed(&self) -> bool {
+        self.workdir.as_ref().is_none_or(|d| d.is_dir())
+    }
 }
 
 /// A configured SteamGridDB lookup that skips the name search.
@@ -354,14 +418,33 @@ fn locate() -> Result<Option<PathBuf>, String> {
     Ok(candidates().into_iter().find(|p| p.is_file()))
 }
 
-fn read(path: &Path) -> Result<Config, String> {
+/// Reads and parses the config. Keys that nothing reads (a typo like `[evn]`, or a
+/// table an older rsgl doesn't know) aren't an error; they come back as warnings.
+fn read(path: &Path) -> Result<(Config, Vec<String>), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse(text: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
+    let mut unknown = Vec::new();
+    let cfg = serde_ignored::deserialize(toml::Deserializer::parse(text)?, |key| {
+        unknown.push(format!("unknown key `{key}`, ignored"));
+    })?;
+    Ok((cfg, unknown))
+}
+
+/// `read`, with the warnings printed to the console.
+fn read_and_warn(path: &Path) -> Result<Config, String> {
+    let (cfg, unknown) = read(path)?;
+    for w in unknown {
+        eprintln!("rsgl: {}: {w}", path.display());
+    }
+    Ok(cfg)
 }
 
 /// Finds and parses the config. If no file exists, writes an example to the
 /// first location and returns an error telling the user about it.
-pub fn load() -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String> {
+pub fn load() -> Result<Settings, String> {
     let Some(path) = locate()? else {
         let candidates = candidates();
         let target = candidates
@@ -376,14 +459,14 @@ pub fn load() -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String> {
             target.display()
         ));
     };
-    build(read(&path)?).map_err(|e| format!("{}: {e}", path.display()))
+    build(read_and_warn(&path)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Like `load`, for commands that run without a window: a missing config is just
 /// an error, and nothing is written to disk.
-pub fn load_existing() -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String> {
+pub fn load_existing() -> Result<Settings, String> {
     let path = locate()?.ok_or_else(no_config)?;
-    build(read(&path)?).map_err(|e| format!("{}: {e}", path.display()))
+    build(read_and_warn(&path)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn no_config() -> String {
@@ -515,7 +598,7 @@ struct Shared {
 
 /// Turns the parsed file into games: fills in variables, expands paths, finds
 /// covers, resolves menus. Hidden games are skipped without being checked.
-fn build(cfg: Config) -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String> {
+fn build(cfg: Config) -> Result<Settings, String> {
     let vars = Vars::default().with(&cfg.vars).map_err(|e| format!("[vars]: {e}"))?;
     let shared = Shared { vars, env: cfg.env, menu: cfg.right_click };
 
@@ -524,7 +607,14 @@ fn build(cfg: Config) -> Result<(Vec<Game>, UiCfg, ApiCfg, PlaytimeCfg), String>
         games.push(build_game(g, &shared)?);
     }
     games.sort_by_cached_key(|g| g.name.to_lowercase());
-    Ok((games, cfg.ui, cfg.api, cfg.playtime))
+    Ok(Settings {
+        games,
+        ui: cfg.ui,
+        api: cfg.api,
+        playtime: cfg.playtime,
+        keyboard: cfg.keyboard,
+        gamepad: cfg.gamepad,
+    })
 }
 
 fn build_game(g: GameCfg, shared: &Shared) -> Result<Game, String> {
@@ -590,6 +680,8 @@ fn build_game(g: GameCfg, shared: &Shared) -> Result<Game, String> {
             .steamgriddb_id
             .map(ArtId::SteamGridDb)
             .or(g.steam_appid.map(ArtId::Steam)),
+        grid_id: g.grid_id,
+        hero_id: g.hero_id,
         name: g.name,
     })
 }
@@ -610,7 +702,9 @@ pub struct Report {
 /// couldn't be found, read or parsed at all.
 pub fn check() -> Result<Report, String> {
     let path = locate()?.ok_or_else(no_config)?;
-    let mut report = check_config(read(&path)?);
+    let (cfg, unknown) = read(&path)?;
+    let mut report = check_config(cfg);
+    report.warnings.extend(unknown);
     report.path = path;
     Ok(report)
 }
@@ -734,10 +828,11 @@ pub fn describe(g: &Game) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::Action;
 
     fn games(text: &str) -> Result<Vec<Game>, String> {
         let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
-        build(cfg).map(|(games, ..)| games)
+        build(cfg).map(|s| s.games)
     }
 
     #[test]
@@ -1058,6 +1153,60 @@ env = { SHARED = "mine", ONLY_A = "1" }
         assert!(games("[env]\nK = 1\n[[game]]\nname = \"A\"\nexec = \"a\"\n").is_err());
     }
 
+    #[test]
+    fn keyboard_and_gamepad_tables_are_read_and_checked() {
+        let (cfg, unknown) = parse("[keyboard]\nlaunch = [\"F2\"]\n[gamepad]\nlaunch = [\"X\"]\n").unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(cfg.keyboard.label(Action::Launch).as_deref(), Some("F2"));
+        assert_eq!(cfg.gamepad.label(Action::Launch).as_deref(), Some("X"));
+
+        let e = parse("[gamepad]\nback = [\"Circle\"]\n").err().unwrap().to_string();
+        assert!(e.contains("gamepad") && e.contains("unknown button \"Circle\""), "{e}");
+    }
+
+    #[test]
+    fn unknown_keys_are_warnings_not_errors() {
+        let (cfg, unknown) = parse(
+            "[evn]\nK = \"1\"\n[ui]\nblurr = 3\n[[game]]\nname = \"A\"\nexec = \"a\"\ncovr = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.games.len(), 1);
+        assert_eq!(unknown.len(), 3, "{unknown:?}");
+        for key in ["`evn`", "`ui.blurr`", "`game.0.covr`"] {
+            assert!(unknown.iter().any(|w| w.contains(key)), "{key} in {unknown:?}");
+        }
+        // menu entries still reject unknown keys, see MenuCfg
+        let menu = "[[game]]\nname = \"A\"\nexec = \"a\"\n[[game.right_click]]\ntitle = \"T\"\nexec = \"t\"\nhidden = true\n";
+        assert!(parse(menu).is_err());
+    }
+
+    #[test]
+    fn a_game_is_installed_when_its_workdir_exists_or_isnt_set() {
+        let dir = std::env::temp_dir();
+        let g = games(&format!(
+            r#"
+[[game]]
+name = "Here"
+exec = "a"
+workdir = {dir:?}
+
+[[game]]
+name = "Gone"
+exec = "a"
+workdir = "/rsgl-test/no/such/dir"
+
+[[game]]
+name = "No workdir"
+exec = "a"
+"#
+        ))
+        .unwrap();
+        let installed = |name: &str| g.iter().find(|g| g.name == name).unwrap().installed();
+        assert!(installed("Here"));
+        assert!(!installed("Gone"));
+        assert!(installed("No workdir"));
+    }
+
     fn checked(text: &str) -> Report {
         check_config(toml::from_str(text).unwrap())
     }
@@ -1110,5 +1259,13 @@ workdir = "/also/not/here"
         let r = checked("[vars]\nx = [1]\n[[game]]\nname = \"A\"\nexec = \"a\"\n");
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("[vars]"));
+    }
+
+    #[test]
+    fn grid_and_hero_ids_are_read() {
+        let g = games("[[game]]\nname = \"A\"\nexec = \"a\"\ngrid_id = 664940\nhero_id = 15208\n").unwrap();
+        assert_eq!((g[0].grid_id, g[0].hero_id), (Some(664940), Some(15208)));
+        let g = games("[[game]]\nname = \"A\"\nexec = \"a\"\n").unwrap();
+        assert_eq!((g[0].grid_id, g[0].hero_id), (None, None));
     }
 }

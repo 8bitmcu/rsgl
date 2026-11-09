@@ -1,6 +1,6 @@
 [package]
 name = "rsgl"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 
 [dependencies]
@@ -13,7 +13,11 @@ egui_extras = { version = "0.31", default-features = false, features = ["file", 
 # the default formats pull in avif (the rav1e encoder), exr, tiff and more that we never read
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 directories = "5"
+# gamepad input; on Linux it links libudev (build needs libudev-dev / systemd-devel)
+gilrs = "0.11"
 serde = { version = "1.0.229", features = ["derive"] }
+# lists the config keys serde skipped, so typos like [evn] get a warning
+serde_ignored = "0.1.14"
 toml = "1.1.8"
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2.1.3"

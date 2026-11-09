@@ -4,10 +4,12 @@
 mod api;
 mod blur;
 mod config;
+mod gamepad;
+mod keys;
 mod playtime;
 mod ui;
 
-use config::{ApiCfg, Game, PlaytimeCfg, UiCfg};
+use config::{Game, Settings};
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -29,11 +31,13 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The shell command that runs `exec`, in its own process group so the game
-/// outlives the launcher.
+/// outlives the launcher. No `exec` prefix: it would replace the shell with the
+/// first command of a list like `a && b`, so `b` would never run. Playtime tracks
+/// the whole group, so the shell staying around doesn't matter.
 #[cfg(unix)]
 fn shell_command(exec: &str) -> Command {
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(format!("exec {exec}")).process_group(0);
+    cmd.arg("-c").arg(exec).process_group(0);
     cmd
 }
 
@@ -256,7 +260,7 @@ fn run_action(action: Action) -> i32 {
     if action == Action::Check {
         return run_check();
     }
-    let (games, _ui, _api, pt) = match config::load_existing() {
+    let Settings { games, playtime: pt, .. } = match config::load_existing() {
         Ok(loaded) => loaded,
         Err(e) => return fail(e),
     };
@@ -358,14 +362,14 @@ fn main() -> eframe::Result {
         std::process::exit(run_action(action));
     }
 
-    let (games, ui_cfg, api_cfg, pt_cfg, error) = match config::load() {
-        Ok((g, u, a, p)) => (g, u, a, p, None),
-        Err(e) => (vec![], UiCfg::default(), ApiCfg::default(), PlaytimeCfg::default(), Some(e)),
+    let (settings, error) = match config::load() {
+        Ok(s) => (s, None),
+        Err(e) => (Settings::default(), Some(e)),
     };
 
     // kept open while the window is up; std opens files close-on-exec, so the
     // tracker below doesn't hold on to it
-    let _instance = if ui_cfg.single_instance {
+    let _instance = if settings.ui.single_instance {
         match lock(&config::lock_file(), false) {
             Some(f) => Some(f),
             None => {
@@ -377,9 +381,9 @@ fn main() -> eframe::Result {
         None
     };
 
-    let track = pt_cfg.enabled;
-    let checkpoint = pt_cfg.checkpoint_minutes * 60;
-    let launched = ui::run(games, ui_cfg, api_cfg, pt_cfg, error, fullscreen, search)?;
+    let track = settings.playtime.enabled;
+    let checkpoint = settings.playtime.checkpoint_minutes * 60;
+    let launched = ui::run(settings, error, fullscreen, search)?;
 
     if let Some(l) = launched.filter(|_| track) {
         start_tracker(&l, checkpoint);
@@ -393,6 +397,13 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
         parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_runs_the_whole_command_list() {
+        let out = shell_command("test -n 'x' && echo second").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "second\n");
     }
 
     #[test]
