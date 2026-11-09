@@ -99,17 +99,30 @@ impl Client {
         Ok(None)
     }
 
-    /// Best-scored portrait grid, falling back to any shape.
-    fn fetch_cover(&self, id: u64, name: &str) -> Res<Option<PathBuf>> {
-        let dims = [Some("600x900,342x482,660x930"), None];
-        match self.best("grids", id, &dims)? {
+    /// One specific `kind` ("grids" or "heroes") asset by its SteamGridDB id.
+    fn asset(&self, kind: &str, id: u64) -> Res<Option<Asset>> {
+        let found: Single<Asset> = self.get(&format!("/{kind}/{id}"))?;
+        Ok(found.data)
+    }
+
+    /// The pinned grid, or the game's best-scored portrait grid, falling back to any shape.
+    fn fetch_cover(&self, pick: Pick, name: &str) -> Res<Option<PathBuf>> {
+        let found = match pick {
+            Pick::Asset(id) => self.asset("grids", id)?,
+            Pick::Best(game) => self.best("grids", game, &[Some("600x900,342x482,660x930"), None])?,
+        };
+        match found {
             Some(a) => self.download(&a, &config::covers_dir(), name),
             None => Ok(None),
         }
     }
 
-    fn fetch_hero(&self, id: u64, name: &str) -> Res<Option<PathBuf>> {
-        match self.best("heroes", id, &[None])? {
+    fn fetch_hero(&self, pick: Pick, name: &str) -> Res<Option<PathBuf>> {
+        let found = match pick {
+            Pick::Asset(id) => self.asset("heroes", id)?,
+            Pick::Best(game) => self.best("heroes", game, &[None])?,
+        };
+        match found {
             Some(a) => self.download(&a, &config::heroes_dir(), name),
             None => Ok(None),
         }
@@ -121,7 +134,8 @@ impl Client {
             "image/png" => "png",
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
-            _ => return Ok(None),
+            // only a pinned asset can get here, the searches ask for these three
+            other => return Err(format!("{other} isn't supported, only png, jpeg and webp").into()),
         };
 
         fs::create_dir_all(dir)?;
@@ -140,6 +154,15 @@ impl Client {
     }
 }
 
+/// Which SteamGridDB asset to download.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// This exact grid or hero, from `grid_id` or `hero_id`.
+    Asset(u64),
+    /// The best-scored one of this SteamGridDB game.
+    Best(u64),
+}
+
 pub enum Update {
     Cover(usize, PathBuf),
     Background(usize, PathBuf),
@@ -153,11 +176,61 @@ pub struct Job {
     pub cover: Option<PathBuf>,
     /// Configured id to look the game up by instead of its name.
     pub art_id: Option<config::ArtId>,
+    /// Configured grid to use as the cover.
+    pub grid_id: Option<u64>,
+    /// Configured hero to use for the background.
+    pub hero_id: Option<u64>,
 }
 
-/// Remembers which configured id the cached cover and hero were fetched with.
-fn art_id_marker(name: &str) -> PathBuf {
-    config::covers_dir().join(format!("{}.id", config::slug(name)))
+impl Job {
+    /// What the configured ids say the cover should come from, if they say anything.
+    fn cover_source(&self) -> Option<String> {
+        self.grid_id.map(|id| format!("grid:{id}")).or(self.art_id.map(|a| a.to_string()))
+    }
+
+    fn hero_source(&self) -> Option<String> {
+        self.hero_id.map(|id| format!("hero:{id}")).or(self.art_id.map(|a| a.to_string()))
+    }
+}
+
+/// Remembers which configured source the cached image in `dir` was fetched from.
+fn source_marker(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.id", config::slug(name)))
+}
+
+/// True if the image `marker` belongs to was fetched from something other than `source`.
+/// Without a configured source any cached image will do.
+fn stale(marker: &Path, source: Option<&str>) -> bool {
+    source.is_some_and(|s| fs::read_to_string(marker).ok().as_deref() != Some(s))
+}
+
+fn mark(marker: &Path, source: Option<&str>) {
+    if let Some(s) = source {
+        let _ = marker
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|_| fs::write(marker, s));
+    }
+}
+
+/// The game's SteamGridDB id, by its configured id or else by name. Failures are
+/// printed and give `None`.
+fn lookup(client: &Client, j: &Job) -> Option<u64> {
+    let found = match j.art_id {
+        Some(art) => client.resolve(art),
+        None => client.search(&j.name),
+    };
+    match found {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => {
+            eprintln!("no SteamGridDB match for {:?}", j.name);
+            None
+        }
+        Err(e) => {
+            eprintln!("SteamGridDB lookup failed for {:?}: {e}", j.name);
+            None
+        }
+    }
 }
 
 /// Blurs the hero (or the cover if there's no hero) into the backgrounds cache.
@@ -222,66 +295,55 @@ pub fn spawn_fetcher(
         let Some(client) = client else { return };
         for (j, hero) in &mut jobs {
             let name = &j.name;
-            // cached art from a name search (or an older id) may be the wrong game,
-            // so fetch it again once with the configured id. Covers set with
+            // cached art from a name search (or an older id or asset) may not be what
+            // the config asks for, so fetch it again once. Covers set with
             // `cover = ...` outside the cache are left alone.
-            let marker = art_id_marker(name);
-            if let Some(art) = j.art_id {
-                if fs::read_to_string(&marker).ok() != Some(art.to_string()) {
-                    if j.cover.is_some() && j.cover == config::find_cover(name) {
-                        j.cover = None;
-                    }
-                    *hero = None;
-                }
+            let (cover_src, hero_src) = (j.cover_source(), j.hero_source());
+            let cover_marker = source_marker(&config::covers_dir(), name);
+            let hero_marker = source_marker(&config::heroes_dir(), name);
+            if stale(&cover_marker, cover_src.as_deref()) && j.cover.is_some() && j.cover == config::find_cover(name) {
+                j.cover = None;
+            }
+            if stale(&hero_marker, hero_src.as_deref()) {
+                *hero = None;
             }
             if j.cover.is_some() && hero.is_some() {
                 continue;
             }
-            let found = match j.art_id {
-                Some(art) => client.resolve(art),
-                None => client.search(name),
-            };
-            let id = match found {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    eprintln!("no SteamGridDB match for {name:?}");
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("SteamGridDB lookup failed for {name:?}: {e}");
-                    continue;
-                }
-            };
-            let mut failed = false;
 
-            if j.cover.is_none() {
-                match client.fetch_cover(id, name) {
-                    Ok(Some(path)) => {
-                        j.cover = Some(path.clone());
-                        if !send(Update::Cover(j.index, path)) {
-                            return;
+            // the game itself is only needed for art that isn't pinned to an asset
+            let unpinned = (j.cover.is_none() && j.grid_id.is_none()) || (hero.is_none() && j.hero_id.is_none());
+            let game = if unpinned { lookup(&client, j) } else { None };
+            let pick = |pinned: Option<u64>| pinned.map(Pick::Asset).or(game.map(Pick::Best));
+
+            if let Some(p) = pick(j.grid_id).filter(|_| j.cover.is_none()) {
+                match client.fetch_cover(p, name) {
+                    Ok(found) => {
+                        mark(&cover_marker, cover_src.as_deref());
+                        match found {
+                            Some(path) => {
+                                j.cover = Some(path.clone());
+                                if !send(Update::Cover(j.index, path)) {
+                                    return;
+                                }
+                            }
+                            None => eprintln!("no cover found for {name:?}"),
                         }
                     }
-                    Ok(None) => eprintln!("no cover found for {name:?}"),
-                    Err(e) => {
-                        eprintln!("cover fetch failed for {name:?}: {e}");
-                        failed = true;
-                    }
+                    Err(e) => eprintln!("cover fetch failed for {name:?}: {e}"),
                 }
             }
-            if hero.is_none() {
-                match client.fetch_hero(id, name) {
-                    Ok(Some(path)) => *hero = Some(path),
-                    Ok(None) => eprintln!("no hero found for {name:?}"),
-                    Err(e) => {
-                        eprintln!("hero fetch failed for {name:?}: {e}");
-                        failed = true;
+            if let Some(p) = pick(j.hero_id).filter(|_| hero.is_none()) {
+                match client.fetch_hero(p, name) {
+                    Ok(found) => {
+                        mark(&hero_marker, hero_src.as_deref());
+                        match found {
+                            Some(path) => *hero = Some(path),
+                            None => eprintln!("no hero found for {name:?}"),
+                        }
                     }
+                    Err(e) => eprintln!("hero fetch failed for {name:?}: {e}"),
                 }
-            }
-            if let Some(art) = j.art_id.filter(|_| !failed) {
-                let _ = fs::create_dir_all(config::covers_dir())
-                    .and_then(|_| fs::write(&marker, art.to_string()));
             }
 
             // cheap if nothing changed, blurred() reuses the cached file
@@ -294,4 +356,39 @@ pub fn spawn_fetcher(
     });
 
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(art_id: Option<config::ArtId>, grid_id: Option<u64>, hero_id: Option<u64>) -> Job {
+        Job { index: 0, name: "A".into(), cover: None, art_id, grid_id, hero_id }
+    }
+
+    #[test]
+    fn pinned_assets_win_over_the_game_id() {
+        let art = Some(config::ArtId::Steam(367520));
+        let j = job(art, Some(664940), None);
+        assert_eq!(j.cover_source().as_deref(), Some("grid:664940"));
+        assert_eq!(j.hero_source().as_deref(), Some("steam:367520"));
+
+        let j = job(None, None, Some(15208));
+        assert_eq!(j.cover_source(), None, "nothing configured for the cover");
+        assert_eq!(j.hero_source().as_deref(), Some("hero:15208"));
+    }
+
+    #[test]
+    fn stale_until_marked_with_the_same_source() {
+        let marker = std::env::temp_dir().join(format!("rsgl-test-{}/a.id", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        assert!(!stale(&marker, None), "no configured source keeps whatever is cached");
+        assert!(stale(&marker, Some("grid:1")), "no marker yet");
+
+        mark(&marker, Some("grid:1"));
+        assert!(!stale(&marker, Some("grid:1")));
+        assert!(stale(&marker, Some("grid:2")), "a changed id fetches again");
+
+        let _ = fs::remove_dir_all(marker.parent().unwrap());
+    }
 }

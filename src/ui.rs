@@ -1,10 +1,12 @@
 use crate::{
     api,
-    config::{self, ApiCfg, Game, MenuAction, PlaytimeCfg, UiCfg},
+    config::{self, Game, MenuAction, Settings},
+    gamepad::Pad,
+    keys::{Action, Keymap},
     launch, playtime, spawn, Launched,
 };
 use eframe::egui;
-use egui::{vec2, Align, Align2, Color32, FontId, Key, Modifiers, RichText, Stroke};
+use egui::{vec2, Align, Align2, Color32, FontId, RichText, Stroke};
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
@@ -30,19 +32,19 @@ const FADE: f32 = 0.4;
 const BG_DIM: u8 = 90;
 /// Widest the search bar gets, so it doesn't stretch across ultrawide screens.
 const SEARCH_MAX_W: f32 = 720.0;
+/// How bright a game that isn't installed is drawn (0-1), see `Game::installed`.
+const NOT_INSTALLED_DIM: f32 = 0.35;
 
 /// Opens the window and runs the launcher until it closes. Returns the launched
 /// game if it should have its playtime tracked.
 pub fn run(
-    games: Vec<Game>,
-    cfg: UiCfg,
-    api_cfg: ApiCfg,
-    pt_cfg: PlaytimeCfg,
+    settings: Settings,
     error: Option<String>,
     fullscreen: bool,
     search: String,
 ) -> eframe::Result<Option<Launched>> {
-    let key = api_cfg.steamgriddb_key();
+    let Settings { games, ui: cfg, api, playtime: pt_cfg, keyboard, gamepad } = settings;
+    let key = api.steamgriddb_key();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
@@ -73,6 +75,7 @@ pub fn run(
                 selected: 0,
                 page_rows: 1,
                 card_w: cfg.card_width.clamp(80.0, 400.0),
+                controls: Controls { keys: keyboard, pad: Pad::start(&cc.egui_ctx, gamepad) },
                 rx,
                 bg: None,
                 prev_bg: None,
@@ -100,6 +103,8 @@ fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) ->
             name: g.name.clone(),
             cover: g.cover.clone().filter(|p| p.exists()),
             art_id: g.art_id,
+            grid_id: g.grid_id,
+            hero_id: g.hero_id,
         })
         .collect();
     let ctx = ctx.clone();
@@ -161,18 +166,21 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
         .animate_bool_with_time(resp.id, selected || resp.hovered(), 0.12);
     let radius = egui::CornerRadius::same(10);
     let cover = egui::Rect::from_min_size(rect.min, vec2(w, cover_h)).expand(lift * LIFT);
+    // a game that isn't installed is drawn dimmed
+    let dim = if g.installed() { 1.0 } else { NOT_INSTALLED_DIM };
 
     match g.cover.as_ref().filter(|c| c.exists()) {
         Some(path) => {
             egui::Image::new(format!("file://{}", path.display()))
                 .corner_radius(radius)
+                .tint(Color32::WHITE.gamma_multiply(dim))
                 .paint_at(ui, cover);
         }
         None => {
             // colored placeholder derived from the name
             let hash = g.name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
             let hue = (hash % 360) as f32 / 360.0;
-            let fill = Color32::from(egui::ecolor::Hsva::new(hue, 0.45, 0.35, 1.0));
+            let fill = Color32::from(egui::ecolor::Hsva::new(hue, 0.45, 0.35 * dim, 1.0));
             ui.painter().rect_filled(cover, radius, fill);
             let initial: String = g.name.chars().next().unwrap_or('?').to_uppercase().collect();
             ui.painter().text(
@@ -180,7 +188,7 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
                 Align2::CENTER_CENTER,
                 initial,
                 FontId::proportional(w * 0.4),
-                Color32::from_white_alpha(190),
+                Color32::from_white_alpha((190.0 * dim) as u8),
             );
         }
     }
@@ -196,7 +204,7 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
 
     let label_rect =
         egui::Rect::from_min_size(rect.min + vec2(0.0, cover_h + 8.0), vec2(w, LABEL_H - 8.0));
-    let color = if selected { Color32::WHITE } else { Color32::from_gray(170) };
+    let color = if selected { Color32::WHITE } else { Color32::from_gray(170) }.gamma_multiply(dim);
     ui.put(
         label_rect,
         egui::Label::new(RichText::new(&g.name).size(13.0).color(color))
@@ -215,6 +223,7 @@ struct App {
     selected: usize, // position within the filtered list
     page_rows: usize, // rows that fit in the grid, for PageUp/PageDown
     card_w: f32,
+    controls: Controls,
     rx: mpsc::Receiver<api::Update>,
     bg: Option<PathBuf>,      // background currently fading in / shown
     prev_bg: Option<PathBuf>, // background fading out
@@ -225,6 +234,20 @@ struct App {
     swallow_click: bool, // a click closed the menu, so it must not also launch the card under it
     maximize: bool, // send a maximize request on the first frame
     fullscreen: bool, // same for fullscreen (-f)
+}
+
+/// The keyboard and the gamepads, asked together: an action happens when either one
+/// triggers it.
+struct Controls {
+    keys: Keymap,
+    pad: Pad,
+}
+
+impl Controls {
+    fn take(&mut self, ctx: &egui::Context, action: Action) -> bool {
+        // `|`, not `||`: both get used up, so neither carries over
+        self.keys.take(ctx, action) | self.pad.take(action)
+    }
 }
 
 /// An open right-click menu.
@@ -268,8 +291,8 @@ impl App {
     /// On an error the current games are kept. Window and playtime settings
     /// still need a restart.
     fn reload(&mut self, ctx: &egui::Context) {
-        let (mut games, ui, api) = match config::load() {
-            Ok((g, u, a, _)) => (g, u, a),
+        let Settings { mut games, ui, api, keyboard, gamepad, .. } = match config::load() {
+            Ok(s) => s,
             Err(e) => {
                 self.error = Some(e);
                 return;
@@ -284,6 +307,8 @@ impl App {
         self.games = games;
         self.menu = None;
         self.card_w = ui.card_width.clamp(80.0, 400.0);
+        self.controls.keys = keyboard;
+        self.controls.pad.map = gamepad;
         self.error = None;
     }
 
@@ -327,9 +352,14 @@ impl App {
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                // rsgl stays open, so reap the tool when it exits instead of leaving a zombie
+                // rsgl stays open, so reap the tool when it exits instead of leaving a zombie.
+                // Repaint then too: an install or uninstall tool changes which games are dimmed
                 Ok(mut child) => {
-                    thread::spawn(move || child.wait());
+                    let ctx = ctx.clone();
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                        ctx.request_repaint();
+                    });
                 }
                 Err(err) => self.fail(format!("Couldn't run \"{}\": {err}", e.title)),
             },
@@ -460,30 +490,29 @@ impl eframe::App for App {
             }
         }
 
-        // An open menu takes the keys: arrows move, Enter runs, Esc closes.
+        let (now, focused) = ctx.input(|i| (i.time, i.focused));
+        self.controls.pad.update(now, focused);
+        if let Some(t) = self.controls.pad.next_repeat() {
+            ctx.request_repaint_after_secs((t - now) as f32);
+        }
+
+        // An open menu takes the keys: up/down move, launch runs, back closes.
         let menu_open = self.menu.is_some();
         let mut chosen = None;
         let mut close_menu = false;
         if let Some(m) = &mut self.menu {
             let count = self.games[m.game].menu.len();
-            let (up, down, enter, esc) = ctx.input_mut(|i| {
-                (
-                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
-                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
-                    i.consume_key(Modifiers::NONE, Key::Enter),
-                    i.consume_key(Modifiers::NONE, Key::Escape),
-                )
-            });
-            if up {
+            let input = &mut self.controls;
+            if input.take(ctx, Action::Up) {
                 m.selected = (m.selected + count - 1) % count;
             }
-            if down {
+            if input.take(ctx, Action::Down) {
                 m.selected = (m.selected + 1) % count;
             }
-            if enter {
+            if input.take(ctx, Action::Launch) {
                 chosen = Some((m.game, m.selected));
             }
-            close_menu = esc;
+            close_menu = input.take(ctx, Action::Back);
         }
         // a click that closed the menu is over once the button comes up
         let swallow = self.swallow_click;
@@ -491,8 +520,8 @@ impl eframe::App for App {
             self.swallow_click = false;
         }
 
-        // Esc clears the search first, then quits
-        if !menu_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        // back clears the search first, then quits
+        if !menu_open && self.controls.take(ctx, Action::Back) {
             if self.query.is_empty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
@@ -507,7 +536,7 @@ impl eframe::App for App {
             moved = true;
         }
 
-        if ctx.input(|i| i.key_pressed(Key::F5)) {
+        if self.controls.take(ctx, Action::Reload) {
             let current = self.filtered().get(self.selected).map(|&i| self.games[i].name.clone());
             self.reload(ctx);
             let shown = self.filtered();
@@ -529,9 +558,8 @@ impl eframe::App for App {
         let mut hovered = None;
         let mut open_menu: Option<(usize, egui::Pos2)> = None;
         let mut selected_rect = None;
-        // Shift+F10 opens the selected game's menu from the keyboard
-        let open_with_key =
-            !menu_open && !shown.is_empty() && ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F10));
+        // opens the selected game's menu from the keyboard or pad (Shift+F10 / Menu by default)
+        let open_with_key = !menu_open && !shown.is_empty() && self.controls.take(ctx, Action::Menu);
 
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin::symmetric(20, 10)))
@@ -550,6 +578,9 @@ impl eframe::App for App {
                         ui.label(RichText::new(format!("· {}", playtime::describe(e))).color(gray));
                     }
                     if let Some(&i) = shown.get(self.selected) {
+                        if !self.games[i].installed() {
+                            ui.label(RichText::new("· not installed").color(gray));
+                        }
                         let tags = &self.games[i].tags;
                         if !tags.is_empty() {
                             ui.label(RichText::new(format!("· {}", tags.join(", "))).color(gray));
@@ -573,52 +604,44 @@ impl eframe::App for App {
                 let w = self.card_w;
                 let cols = ((((ui.available_width() - 2.0 * PAD) + GAP) / (w + GAP)) as usize).max(1);
 
-                // Arrow keys are consumed so the text box doesn't move its cursor
+                // The keys are consumed so the text box doesn't move its cursor
                 if !shown.is_empty() && !menu_open {
-                    let (l, r, u, d, pu, pd) = ctx.input_mut(|i| {
-                        (
-                            i.consume_key(Modifiers::NONE, Key::ArrowLeft),
-                            i.consume_key(Modifiers::NONE, Key::ArrowRight),
-                            i.consume_key(Modifiers::NONE, Key::ArrowUp),
-                            i.consume_key(Modifiers::NONE, Key::ArrowDown),
-                            i.consume_key(Modifiers::NONE, Key::PageUp),
-                            i.consume_key(Modifiers::NONE, Key::PageDown),
-                        )
-                    });
-                    let mut s = self.selected as isize;
-                    if l {
-                        s -= 1;
-                    }
-                    if r {
-                        s += 1;
-                    }
-                    if u {
-                        s -= cols as isize;
-                    }
-                    if d {
-                        s += cols as isize;
-                    }
+                    let input = &mut self.controls;
                     let page = (cols * self.page_rows) as isize;
-                    if pu {
-                        s -= page;
-                    }
-                    if pd {
-                        s += page;
+                    let mut s = self.selected as isize;
+                    for (action, step) in [
+                        (Action::Left, -1),
+                        (Action::Right, 1),
+                        (Action::Up, -(cols as isize)),
+                        (Action::Down, cols as isize),
+                        (Action::PageUp, -page),
+                        (Action::PageDown, page),
+                    ] {
+                        if input.take(ctx, action) {
+                            s += step;
+                        }
                     }
                     let s = s.clamp(0, shown.len() as isize - 1) as usize;
                     if s != self.selected {
                         self.selected = s;
                         moved = true;
                     }
-                    if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    if input.take(ctx, Action::Launch) {
                         to_launch = shown.get(self.selected).copied();
                     }
                 }
 
+                let mut hint = "Search games or t:tag…   (arrows to move".to_string();
+                for (action, what) in [(Action::Launch, "launch"), (Action::Reload, "reload")] {
+                    if let Some(key) = self.controls.keys.label(action) {
+                        hint += &format!(", {key} to {what}");
+                    }
+                }
+                hint.push(')');
                 ui.vertical_centered(|ui| {
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search games or t:tag…   (arrows to move, Enter to launch, F5 to reload)")
+                            .hint_text(hint)
                             .font(FontId::proportional(18.0))
                             .margin(egui::Margin::symmetric(14, 10))
                             .desired_width(ui.available_width().min(SEARCH_MAX_W))

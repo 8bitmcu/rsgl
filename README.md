@@ -20,7 +20,7 @@ of the selected game's art behind the grid.
 - Command-line `--launch`, `--list`, `--show` and `--check`, for hotkeys and scripts
 - Tags, with `t:tag` filtering in the search bar
 - Configurable right-click menu per game: tools, or alternate ways to launch
-- Full keyboard control, mouse works too
+- Full keyboard and gamepad control, mouse works too
 - Automatic cover and hero downloads from SteamGridDB (optional)
 - Blurred, crossfading background for the selected game
 - Per-game working directory and environment variables
@@ -38,6 +38,9 @@ You need a recent stable Rust toolchain.
 cargo build --release
 ./target/release/rsgl
 ```
+
+On Linux, gamepad support needs the libudev headers to build: `libudev-dev` on
+Debian/Ubuntu, `systemd-devel` on Fedora.
 
 rsgl uses `eframe`/`egui` with OpenGL. On Linux it supports both Wayland and
 X11. On Windows it builds with the normal MSVC toolchain (`x86_64-pc-windows-msvc`);
@@ -57,8 +60,8 @@ If neither exists, the first run writes an example config to
 `~/.config/rsgl/rsgl.toml` and shows a message telling you to edit it and
 press F5.
 
-F5 reloads the config without restarting. Games, `card_width`, `blur` and the
-API key apply right away; `single_instance`, `start_maximized` and `[playtime]`
+F5 reloads the config without restarting. Games, `card_width`, `blur`, the
+API key, `[keyboard]` and `[gamepad]` apply right away; `single_instance`, `start_maximized` and `[playtime]`
 need a restart. If the file has an error, the current list stays up and the
 error is shown above it.
 
@@ -90,6 +93,8 @@ hidden = true                                # optional, keep the entry but leav
 tags = ["coop", "lan", "fps"]                # optional, filter with t:coop in the search bar
 steam_appid = 367520                         # optional, find art by Steam app id
 steamgriddb_id = 1234                        # optional, find art by SteamGridDB game id
+grid_id = 664940                             # optional, use this SteamGridDB grid as the cover
+hero_id = 15208                              # optional, use this SteamGridDB hero for the background
 ```
 
 Notes on `[[game]]` entries:
@@ -111,7 +116,18 @@ Notes on `[[game]]` entries:
   number in the game's SteamGridDB URL) to skip the search. If both are set,
   `steamgriddb_id` wins. Adding or changing an id re-downloads the cached cover
   and hero once, replacing what's in the cache.
+- To pick the exact image instead of the best-scored one, set `grid_id` (cover)
+  or `hero_id` (background) to the number in the image's SteamGridDB URL, e.g.
+  `steamgriddb.com/grid/664940`. Each works on its own and wins over the game
+  ids above for that image; the other one is still found as usual. Changing
+  one re-downloads just that image. Only png, jpeg and webp images work; an
+  animated one is reported in the terminal and skipped. A `cover = ...` file
+  that exists still wins over `grid_id`.
 - `hidden = true` hides a game without deleting its entry.
+- A game whose `workdir` doesn't exist is drawn dimmed and marked "not
+  installed" in the status bar. A game without a `workdir` is never dimmed.
+  The grid updates when a right-click tool exits, so an install or uninstall
+  entry shows up right away.
 - `{name}` placeholders in `exec`, `workdir`, `cover` and `env` are filled in from
   `[vars]`, see [Variables](#variables).
 - `tags` is a list of labels for the game, see [Tags](#tags).
@@ -173,7 +189,8 @@ env = { EDITOR = "kate" }
 - Every key below a `[[game.right_click]]` header belongs to that entry, so put
   the game's own keys (`tags`, `hidden`, ...) above it. A key in the wrong place
   is reported as an error instead of being ignored.
-- In the menu: arrows move, Enter runs, Esc closes. Clicking outside closes it
+- In the menu: up/down move, launch runs, back closes (arrows, Enter and Esc
+  unless you [rebound them](#key-bindings)). Clicking outside closes it
   without launching the game under the pointer.
 
 ### Game output
@@ -411,6 +428,81 @@ Commands that run without opening the window (use one):
 | Right-click / Shift+F10 | Open the game's [menu](#right-click-menu), or its `workdir` if it has no entries |
 | F5                      | Reload the config                                                                |
 | Esc                     | Clear the search, or quit if it's empty (closes an open menu first)              |
+
+These are the defaults; see [Key bindings](#key-bindings) to change them. Mouse
+buttons can't be rebound. A gamepad works too, see [Gamepad](#gamepad).
+
+### Key bindings
+
+`[keyboard]` binds each action to a list of keys. An action you leave out keeps
+its default, and an empty list unbinds it:
+
+```toml
+[keyboard]
+launch = ["Enter"]
+menu = ["Shift+F10", "Ctrl+M"]
+reload = []               # F5 does nothing now
+```
+
+| Action      | Default     | Does                                                         |
+| ----------- | ----------- | ------------------------------------------------------------ |
+| `up`        | `Up`        | Move up a row (up an entry in the menu)                      |
+| `down`      | `Down`      | Move down a row (down an entry in the menu)                  |
+| `left`      | `Left`      | Move left                                                    |
+| `right`     | `Right`     | Move right                                                   |
+| `page_up`   | `PageUp`    | Move a screen up                                             |
+| `page_down` | `PageDown`  | Move a screen down                                           |
+| `launch`    | `Enter`     | Launch the selected game, or run the highlighted menu entry |
+| `menu`      | `Shift+F10` | Open the selected game's right-click menu                    |
+| `back`      | `Escape`    | Close the menu, else clear the search, else quit             |
+| `reload`    | `F5`        | Reload the config                                            |
+
+- Keys use egui's names: `Enter`, `Escape` (or `Esc`), `Tab`, `Home`, `End`,
+  `PageUp`, `F1`-`F35`, `Up`/`Down`/`Left`/`Right`, letters, digits, and
+  punctuation either by symbol (`/`) or name (`Slash`).
+- Modifiers go in front with `+`: `Ctrl`, `Alt` and `Shift`, like
+  `Ctrl+Alt+M` or `Ctrl++`. They must match exactly, so `Enter` doesn't fire on
+  `Alt+Enter`.
+- Letters, digits, punctuation, `Space`, `Backspace` and `Delete` type into or
+  edit the search box, so they need `Ctrl` or `Alt` (`Ctrl+L` is fine, `L` or
+  `Shift+L` isn't).
+- An unknown action, an unknown key, or a key bound to two actions is an
+  error, shown like any other config error. Rebinding `back` to `Enter` means
+  moving `launch` off it too.
+
+### Gamepad
+
+Any gamepad works alongside the keyboard, and can be plugged in while rsgl is
+open. `[gamepad]` binds the same actions to buttons, with the same rules as
+`[keyboard]`:
+
+```toml
+[gamepad]
+menu = ["Menu", "Y"]
+reload = []
+```
+
+| Action      | Default                       |
+| ----------- | ----------------------------- |
+| `up`        | `DPadUp`, `LeftStickUp`       |
+| `down`      | `DPadDown`, `LeftStickDown`   |
+| `left`      | `DPadLeft`, `LeftStickLeft`   |
+| `right`     | `DPadRight`, `LeftStickRight` |
+| `page_up`   | `LB`                          |
+| `page_down` | `RB`                          |
+| `launch`    | `A`                           |
+| `menu`      | `Menu`                        |
+| `back`      | `B`                           |
+| `reload`    | `View`                        |
+
+- Buttons are named after the Xbox layout and matched by position, so `A` is
+  the bottom face button on any pad (Cross on a PlayStation pad): `A`, `B`,
+  `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `View`, `Menu`, `Guide`, `LS`, `RS` (stick
+  clicks), `DPadUp`/`Down`/`Left`/`Right`, and
+  `LeftStickUp`/`Down`/`Left`/`Right` for tilting the left stick.
+- Holding a direction or `LB`/`RB` repeats it; other buttons don't.
+- rsgl ignores the gamepad while its window isn't focused, so a tool started
+  from the menu can be used with the pad without rsgl reacting too.
 
 ## Cache
 
