@@ -99,6 +99,11 @@ fn wait_finished(pid: u32, wait: Duration) -> bool {
     }
 }
 
+/// Waits until the game has finished, without recording its playtime.
+pub fn wait(pgid: u32) {
+    while !wait_finished(pgid, POLL) {}
+}
+
 /// Waits until the game has finished (on Unix, until its process group is empty),
 /// saving the time played every `checkpoint` (if non-zero) and once more at the end.
 pub fn track(pgid: u32, name: &str, checkpoint: Duration) {
@@ -121,17 +126,24 @@ pub fn track(pgid: u32, name: &str, checkpoint: Duration) {
     }
 }
 
-/// "42h 10m · last played 3 days ago"
-pub fn describe(e: &Entry) -> String {
+/// Total time played: "42h 10m".
+pub fn played(e: &Entry) -> String {
     let m = e.seconds / 60;
-    let total = if m >= 60 { format!("{}h {}m", m / 60, m % 60) } else { format!("{m}m") };
+    if m >= 60 {
+        format!("{}h {}m", m / 60, m % 60)
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// When the game was last played: "3 days ago".
+pub fn last_played(e: &Entry) -> String {
     let ago = now().saturating_sub(e.last_played);
     let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
-    let when = match ago {
+    match ago {
         0..60 => "just now".to_string(),
         60..3600 => plural(ago / 60, "minute"),
         3600..86400 => plural(ago / 3600, "hour"),
         _ => plural(ago / 86400, "day"),
-    };
-    format!("{total} · last played {when}")
+    }
 }

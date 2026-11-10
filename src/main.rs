@@ -1,17 +1,19 @@
 // Release builds on Windows are GUI programs, so no console window opens next to the launcher.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod api;
+mod api_igdb;
+mod api_steamgriddb;
 mod blur;
 mod config;
 mod gamepad;
 mod keys;
 mod playtime;
+mod status;
+mod topbar;
 mod ui;
 
-use config::{Game, Settings};
+use config::{Game, Settings, Toggles};
 use std::{
-    collections::HashMap,
     fs::{self, File},
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -60,7 +62,8 @@ fn from_terminal() -> bool {
 }
 
 /// Starts `exec` through the shell, detached from rsgl: in `workdir` and with `env`
-/// added to our own environment. Used for games and for right-click menu entries.
+/// changing our own environment (None unsets a variable, see `Env::with`). Used for
+/// games and for right-click menu entries.
 ///
 /// When rsgl was started from a terminal, the program writes to that terminal too,
 /// even after the launcher window has closed. Otherwise its output is discarded.
@@ -69,7 +72,7 @@ fn from_terminal() -> bool {
 ///
 /// The error says why it couldn't start. Only problems that show up while starting
 /// are caught: a command the shell can't find fails after this has already returned.
-fn spawn(exec: &str, workdir: Option<&Path>, env: &HashMap<String, String>) -> Result<Child, String> {
+fn spawn(exec: &str, workdir: Option<&Path>, env: &[(&str, Option<&str>)]) -> Result<Child, String> {
     let mut cmd = shell_command(exec);
     if let Some(dir) = workdir {
         // checked here so the message can name the folder; the OS error alone doesn't
@@ -78,7 +81,13 @@ fn spawn(exec: &str, workdir: Option<&Path>, env: &HashMap<String, String>) -> R
         }
         cmd.current_dir(dir);
     }
-    cmd.envs(env).stdin(Stdio::null());
+    for &(name, value) in env {
+        match value {
+            Some(v) => cmd.env(name, v),
+            None => cmd.env_remove(name),
+        };
+    }
+    cmd.stdin(Stdio::null());
     if from_terminal() {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
@@ -92,9 +101,10 @@ fn spawn(exec: &str, workdir: Option<&Path>, env: &HashMap<String, String>) -> R
     cmd.spawn().map_err(|e| e.to_string())
 }
 
-/// Starts the game and returns its pid (on Unix also its process group id).
-fn launch(g: &Game) -> Result<u32, String> {
-    spawn(&g.exec, g.workdir.as_deref(), &g.env).map(|c| c.id())
+/// Starts the game, with the top bar's `toggles`, and returns its pid (on Unix also its
+/// process group id).
+fn launch(g: &Game, toggles: &Toggles) -> Result<u32, String> {
+    spawn(&g.exec, g.workdir.as_deref(), &g.env.with(toggles)).map(|c| c.id())
 }
 
 /// Takes an exclusive lock on `path`, held until the returned file is dropped
@@ -114,7 +124,7 @@ Usage: rsgl [OPTIONS]
 Options:
   -c, --config <FILE>  Read this config file instead of the default locations
   -f, --fullscreen     Start fullscreen
-  -s, --search <TEXT>  Start with TEXT in the search bar (t:tag filters by tag)
+  -s, --search <TEXT>  Start with TEXT in the search bar (t:tag, g:genre filter)
   -h, --help           Show this help
 
 Commands that run without opening the window (use one):
@@ -122,6 +132,7 @@ Commands that run without opening the window (use one):
       --list           Print the names of all games
       --show <GAME>    Print how GAME will run (exec, workdir, env, menu)
       --check          Check the whole config, hidden games included
+      --igdb <NAME>    Search IGDB for NAME and print the JSON it returns
 ";
 
 /// A command that runs without opening the window.
@@ -131,6 +142,7 @@ enum Action {
     List,
     Show(String),
     Check,
+    Igdb(String),
 }
 
 struct Cli {
@@ -147,7 +159,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
             cli.action = Some(action);
             Ok(())
         }
-        Some(_) => Err("use only one of --launch, --list, --show and --check".to_string()),
+        Some(_) => Err("use only one of --launch, --list, --show, --check and --igdb".to_string()),
     };
     while let Some(arg) = args.next() {
         // `--flag=value` is the same as `--flag value`
@@ -163,7 +175,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
             }
             "--list" if inline.is_none() => set_action(&mut cli, Action::List)?,
             "--check" if inline.is_none() => set_action(&mut cli, Action::Check)?,
-            "-c" | "--config" | "-s" | "--search" | "--show" | "--launch" => {
+            "-c" | "--config" | "-s" | "--search" | "--show" | "--launch" | "--igdb" => {
                 let value = inline
                     .or_else(|| args.next())
                     .ok_or_else(|| format!("{flag} needs an argument"))?;
@@ -171,6 +183,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     "-c" | "--config" => cli.config = Some(PathBuf::from(config::expand(&value))),
                     "-s" | "--search" => cli.search = value,
                     "--show" => set_action(&mut cli, Action::Show(value))?,
+                    "--igdb" => set_action(&mut cli, Action::Igdb(value))?,
                     _ => set_action(&mut cli, Action::Launch(value))?,
                 }
             }
@@ -184,6 +197,72 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
 pub struct Launched {
     pub name: String,
     pub pgid: u32,
+    /// The game's own `playtime` setting.
+    pub playtime: bool,
+}
+
+/// The job of the background copy of rsgl that stays behind after a launch: wait
+/// for the game to exit, saving its playtime along the way if `playtime` is set,
+/// then open the launcher again with the `reopen` arguments if those are set.
+#[derive(Debug, PartialEq)]
+struct Tracker {
+    pgid: u32,
+    /// Game name and checkpoint interval in seconds.
+    playtime: Option<(String, u64)>,
+    reopen: Option<Vec<String>>,
+}
+
+impl Tracker {
+    /// `--track <pgid> [--playtime <checkpoint secs> <name>] [--reopen <args>...]`
+    fn to_args(&self) -> Vec<String> {
+        let mut args = vec!["--track".to_string(), self.pgid.to_string()];
+        if let Some((name, secs)) = &self.playtime {
+            args.extend(["--playtime".to_string(), secs.to_string(), name.clone()]);
+        }
+        if let Some(reopen) = &self.reopen {
+            args.push("--reopen".to_string());
+            args.extend(reopen.iter().cloned());
+        }
+        args
+    }
+
+    /// Reads what `to_args` wrote (without the program name). None for anything else.
+    fn from_args(args: &[String]) -> Option<Self> {
+        let [flag, pgid, rest @ ..] = args else { return None };
+        if flag != "--track" {
+            return None;
+        }
+        let pgid = pgid.parse().ok()?;
+        let (playtime, rest) = match rest {
+            [f, secs, name, rest @ ..] if f == "--playtime" => (Some((name.clone(), secs.parse().ok()?)), rest),
+            _ => (None, rest),
+        };
+        let reopen = match rest {
+            [] => None,
+            [f, reopen @ ..] if f == "--reopen" => Some(reopen.to_vec()),
+            _ => return None,
+        };
+        Some(Self { pgid, playtime, reopen })
+    }
+
+    fn run(self) {
+        match self.playtime {
+            Some((name, secs)) => playtime::track(self.pgid, &name, Duration::from_secs(secs)),
+            None => playtime::wait(self.pgid),
+        }
+        if let Some(args) = self.reopen {
+            if let Err(e) = respawn(&args) {
+                eprintln!("rsgl: can't reopen the launcher: {e}");
+            }
+        }
+    }
+
+    /// Hands the waiting over to a fresh copy of rsgl, see `respawn`.
+    fn start(&self) {
+        if let Err(e) = respawn(&self.to_args()) {
+            eprintln!("rsgl: can't keep watching the game: {e}");
+        }
+    }
 }
 
 /// A GUI-subsystem program has no console of its own, so hook up to the one it was
@@ -218,37 +297,28 @@ fn attach_parent_console() {
     }
 }
 
-/// The game keeps running in its own group. Replace this process with a fresh
-/// copy that only waits for it, so the window's memory (GPU driver, textures,
-/// decoded images) is given back instead of sitting around until the game exits.
-/// exec keeps our pid, so the game stays our child and can still be reaped.
+/// Replaces this process with a fresh copy of rsgl started with `args`. After a
+/// launch the game keeps running in its own group, and a copy that only waits for
+/// it gives the window's memory (GPU driver, textures, decoded images) back instead
+/// of keeping it until the game exits. exec keeps our pid, so the game stays our
+/// child and can still be reaped. Only returns on failure.
 #[cfg(unix)]
-fn start_tracker(l: &Launched, checkpoint: u64) {
-    let err = Command::new("/proc/self/exe")
-        .arg0("rsgl")
-        .args(["--track", &l.pgid.to_string(), &checkpoint.to_string(), &l.name])
-        .exec();
-    eprintln!("rsgl: can't start playtime tracking: {err}");
+fn respawn(args: &[String]) -> Result<(), std::io::Error> {
+    Err(Command::new("/proc/self/exe").arg0("rsgl").args(args).exec())
 }
 
-/// Windows has no exec, so start the waiting copy as a detached process and let
-/// this one exit, which frees the window's memory just the same.
+/// Windows has no exec, so start the copy as a detached process; the caller then
+/// exits, which frees the window's memory just the same.
 #[cfg(windows)]
-fn start_tracker(l: &Launched, checkpoint: u64) {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return eprintln!("rsgl: can't start playtime tracking: {e}"),
-    };
-    let child = Command::new(exe)
-        .args(["--track", &l.pgid.to_string(), &checkpoint.to_string(), &l.name])
+fn respawn(args: &[String]) -> Result<(), std::io::Error> {
+    Command::new(std::env::current_exe()?)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn();
-    if let Err(e) = child {
-        eprintln!("rsgl: can't start playtime tracking: {e}");
-    }
+        .spawn()
+        .map(drop)
 }
 
 /// Runs a command-line action and returns the exit code.
@@ -260,13 +330,26 @@ fn run_action(action: Action) -> i32 {
     if action == Action::Check {
         return run_check();
     }
-    let Settings { games, playtime: pt, .. } = match config::load_existing() {
+    let Settings { games, playtime: pt, api, .. } = match config::load_existing() {
         Ok(loaded) => loaded,
         Err(e) => return fail(e),
     };
 
     match action {
         Action::Check => unreachable!("handled above"),
+        Action::Igdb(name) => {
+            let Some((id, secret)) = api.igdb_credentials() else {
+                return fail("set igdb_client_id and igdb_client_secret under [api] \
+                    (or IGDB_CLIENT_ID and IGDB_CLIENT_SECRET)".into());
+            };
+            match api_igdb::Client::new(id, secret).and_then(|mut c| c.search(&name)) {
+                Ok(json) => {
+                    println!("{}", json.trim_end());
+                    0
+                }
+                Err(e) => fail(format!("IGDB search failed: {e}")),
+            }
+        }
         Action::List => {
             for g in &games {
                 println!("{}", g.name);
@@ -285,13 +368,14 @@ fn run_action(action: Action) -> i32 {
                 Ok(g) => g,
                 Err(e) => return fail(e),
             };
-            match launch(game) {
+            // no window, so no toggles: [env] is what they start from anyway
+            match launch(game, &Toggles::new()) {
                 Ok(pgid) => {
                     // like a launch from the window: with playtime on, a small copy of rsgl
                     // stays behind to time the game (on Unix this replaces this process)
                     if pt.enabled && game.playtime {
-                        let l = Launched { name: game.name.clone(), pgid };
-                        start_tracker(&l, pt.checkpoint_minutes * 60);
+                        let playtime = Some((game.name.clone(), pt.checkpoint_minutes * 60));
+                        Tracker { pgid, playtime, reopen: None }.start();
                     }
                     0
                 }
@@ -330,18 +414,14 @@ fn main() -> eframe::Result {
     #[cfg(windows)]
     attach_parent_console();
 
-    let args: Vec<String> = std::env::args().collect();
-    // internal: `rsgl --track <pgid> <checkpoint secs> <name>`, see below
-    if let [_, flag, pgid, secs, name] = &args[..] {
-        if flag == "--track" {
-            if let (Ok(pgid), Ok(secs)) = (pgid.parse(), secs.parse()) {
-                playtime::track(pgid, name, Duration::from_secs(secs));
-            }
-            return Ok(());
-        }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // internal: the copy that stays behind after a launch, see `Tracker`
+    if let Some(tracker) = Tracker::from_args(&args) {
+        tracker.run();
+        return Ok(());
     }
 
-    let cli = match parse_args(args.into_iter().skip(1)) {
+    let cli = match parse_args(args.iter().cloned()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("rsgl: {e}\n\n{USAGE}");
@@ -383,10 +463,20 @@ fn main() -> eframe::Result {
 
     let track = settings.playtime.enabled;
     let checkpoint = settings.playtime.checkpoint_minutes * 60;
+    let reopen = settings.ui.reopen_after_game;
+    let fullscreen = fullscreen || settings.ui.fullscreen;
     let launched = ui::run(settings, error, fullscreen, search)?;
 
-    if let Some(l) = launched.filter(|_| track) {
-        start_tracker(&l, checkpoint);
+    if let Some(l) = launched {
+        let tracker = Tracker {
+            pgid: l.pgid,
+            playtime: (track && l.playtime).then_some((l.name, checkpoint)),
+            // the same arguments, so the reopened window uses the same config, -f and -s
+            reopen: reopen.then_some(args),
+        };
+        if tracker.playtime.is_some() || tracker.reopen.is_some() {
+            tracker.start();
+        }
     }
     Ok(())
 }
@@ -412,6 +502,7 @@ mod tests {
         assert_eq!(parse(&["--check"]).unwrap().action, Some(Action::Check));
         assert_eq!(parse(&["--show", "Quake"]).unwrap().action, Some(Action::Show("Quake".into())));
         assert_eq!(parse(&["--launch=Left 4 Dead 2"]).unwrap().action, Some(Action::Launch("Left 4 Dead 2".into())));
+        assert_eq!(parse(&["--igdb", "Portal 2"]).unwrap().action, Some(Action::Igdb("Portal 2".into())));
         assert_eq!(parse(&[]).unwrap().action, None);
     }
 
@@ -427,6 +518,23 @@ mod tests {
         assert!(parse(&["--launch"]).err().unwrap().contains("needs an argument"));
         assert!(parse(&["--list=1"]).err().unwrap().contains("unknown argument"));
         assert!(parse(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn tracker_arguments_round_trip() {
+        let strings = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for t in [
+            Tracker { pgid: 42, playtime: None, reopen: None },
+            Tracker { pgid: 42, playtime: Some(("".into(), 300)), reopen: None },
+            Tracker { pgid: 42, playtime: None, reopen: Some(vec![]) },
+            Tracker { pgid: 42, playtime: Some(("--reopen".into(), 0)), reopen: Some(strings(&["-c", "x", "-f"])) },
+        ] {
+            assert_eq!(Tracker::from_args(&t.to_args()), Some(t));
+        }
+        // anything else is left to the normal argument parsing
+        assert_eq!(Tracker::from_args(&strings(&["--track", "x"])), None);
+        assert_eq!(Tracker::from_args(&strings(&["--track", "1", "--nope"])), None);
+        assert_eq!(Tracker::from_args(&strings(&["-f"])), None);
     }
 
     #[test]

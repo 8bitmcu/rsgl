@@ -1,4 +1,4 @@
-use crate::keys::{Action, Bindable, Bindings};
+use crate::keys::{Action, Bindable, Bindings, Press};
 use eframe::egui;
 use std::{collections::HashMap, sync::mpsc, thread, time::Duration};
 
@@ -178,7 +178,7 @@ struct Held {
 pub struct Pad {
     pub map: Padmap,
     rx: mpsc::Receiver<Event>,
-    pressed: Vec<Action>,
+    pressed: Vec<(Action, Press)>,
     held: Vec<Held>,
     /// Which way each pad's stick is pushed on each axis: -1, 0 or 1.
     sticks: HashMap<(usize, bool), i8>,
@@ -284,7 +284,7 @@ impl Pad {
             }
         }
         for h in self.held.iter_mut().filter(|h| h.next <= now) {
-            self.pressed.push(h.action);
+            self.pressed.push((h.action, Press::Repeat));
             h.next = now + REPEAT_EVERY;
         }
     }
@@ -294,7 +294,7 @@ impl Pad {
         let Some(action) = self.map.action(button).filter(|_| pressed) else {
             return;
         };
-        self.pressed.push(action);
+        self.pressed.push((action, Press::Fresh));
         if repeats(action) {
             self.held.push(Held {
                 id,
@@ -338,9 +338,19 @@ impl Pad {
     /// True if a button bound to `action` was pressed (or repeated) this frame.
     /// Like `Keymap::take`, the press is used up.
     pub fn take(&mut self, action: Action) -> bool {
-        let before = self.pressed.len();
-        self.pressed.retain(|&a| a != action);
-        self.pressed.len() != before
+        self.take_press(action).is_some()
+    }
+
+    /// `take`, saying whether the button was pressed just now or is repeating.
+    pub fn take_press(&mut self, action: Action) -> Option<Press> {
+        let mut hit = None;
+        self.pressed.retain(|&(a, press)| {
+            if a == action {
+                hit = Press::or(hit, Some(press));
+            }
+            a != action
+        });
+        hit
     }
 
     /// When the next held button repeats, so the UI can wake up for it.
@@ -418,12 +428,12 @@ mod tests {
         let (mut p, tx) = pad("");
         press(&tx, Button::DPadDown, true);
         p.update(1.0, true);
-        assert!(p.take(Action::Down));
+        assert_eq!(p.take_press(Action::Down), Some(Press::Fresh));
         p.update(1.3, true);
         assert!(!p.take(Action::Down), "not before the delay");
         assert_eq!(p.next_repeat(), Some(1.0 + REPEAT_DELAY));
         p.update(1.45, true);
-        assert!(p.take(Action::Down));
+        assert_eq!(p.take_press(Action::Down), Some(Press::Repeat));
         p.update(1.6, true);
         assert!(p.take(Action::Down));
 

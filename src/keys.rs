@@ -2,8 +2,9 @@ use eframe::egui::{self, Event, Key, Modifiers};
 use serde::{Deserialize, Deserializer};
 use std::{collections::BTreeMap, fmt::Display};
 
-/// Something the keyboard or a gamepad can do. The grid uses all of them; an open right-click
-/// menu uses `Up`/`Down` to move, `Launch` to run the entry and `Back` to close.
+/// Something the keyboard or a gamepad can do. The grid uses all of them; an open menu uses
+/// `Up`/`Down` to move, `Launch` to run the entry and `Back` to close, and the top bar, once
+/// it has the focus, `Left`/`Right` to move, `Launch` to use a widget and `Down`/`Back` to leave.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Up,
@@ -45,6 +46,23 @@ impl Action {
             Action::Menu => "menu",
             Action::Back => "back",
             Action::Reload => "reload",
+        }
+    }
+}
+
+/// How an action was triggered: pressed just now, or repeating because it's held.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Press {
+    Fresh,
+    Repeat,
+}
+
+impl Press {
+    /// Two ways the same action came in this frame: fresh if either is.
+    pub fn or(a: Option<Press>, b: Option<Press>) -> Option<Press> {
+        match (a, b) {
+            (Some(Press::Fresh), _) | (_, Some(Press::Fresh)) => Some(Press::Fresh),
+            (a, b) => a.or(b),
         }
     }
 }
@@ -148,14 +166,22 @@ impl Keymap {
     /// so the search box doesn't also act on it. Modifiers must match exactly, so
     /// "Enter" doesn't also fire on Alt+Enter.
     pub fn take(&self, ctx: &egui::Context, action: Action) -> bool {
+        self.take_press(ctx, action).is_some()
+    }
+
+    /// `take`, saying whether the key was pressed just now or is repeating.
+    pub fn take_press(&self, ctx: &egui::Context, action: Action) -> Option<Press> {
         let bindings = &self.0[action as usize];
         ctx.input_mut(|i| {
-            let mut hit = false;
-            i.events.retain(|e| {
-                let m = matches!(e, Event::Key { key, modifiers, pressed: true, .. }
-                    if bindings.iter().any(|b| b.key == *key && modifiers.matches_exact(b.mods)));
-                hit |= m;
-                !m
+            let mut hit = None;
+            i.events.retain(|e| match e {
+                Event::Key { key, modifiers, pressed: true, repeat, .. }
+                    if bindings.iter().any(|b| b.key == *key && modifiers.matches_exact(b.mods)) =>
+                {
+                    hit = Press::or(hit, Some(if *repeat { Press::Repeat } else { Press::Fresh }));
+                    false
+                }
+                _ => true,
             });
             hit
         })
@@ -305,6 +331,20 @@ mod tests {
         // egui-winit sets both ctrl and command for Ctrl on Linux and Windows
         press(&ctx, Key::M, Modifiers::CTRL | Modifiers::COMMAND);
         assert!(k.take(&ctx, Action::Menu));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn take_press_tells_a_held_key_from_a_fresh_press() {
+        // egui marks a press of a key that's already down as a repeat
+        let k = Keymap::default();
+        let ctx = egui::Context::default();
+        press(&ctx, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(k.take_press(&ctx, Action::Up), Some(Press::Fresh));
+        assert_eq!(k.take_press(&ctx, Action::Up), None, "consumed");
+        let _ = ctx.end_pass();
+        press(&ctx, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(k.take_press(&ctx, Action::Up), Some(Press::Repeat), "still held");
         let _ = ctx.end_pass();
     }
 }
