@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fmt::Display};
 /// Something the keyboard or a gamepad can do. The grid uses all of them; an open menu uses
 /// `Up`/`Down` to move, `Launch` to run the entry and `Back` to close, and the top bar, once
 /// it has the focus, `Left`/`Right` to move, `Launch` to use a widget and `Down`/`Back` to leave.
+/// `PrevFilter`/`NextFilter` switch the top bar's filter from anywhere but an open menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Up,
@@ -17,10 +18,12 @@ pub enum Action {
     Menu,
     Back,
     Reload,
+    PrevFilter,
+    NextFilter,
 }
 
 impl Action {
-    const ALL: [Action; 10] = [
+    const ALL: [Action; 12] = [
         Action::Up,
         Action::Down,
         Action::Left,
@@ -31,6 +34,8 @@ impl Action {
         Action::Menu,
         Action::Back,
         Action::Reload,
+        Action::PrevFilter,
+        Action::NextFilter,
     ];
 
     /// The action's key in `[keyboard]` and `[gamepad]`.
@@ -46,6 +51,8 @@ impl Action {
             Action::Menu => "menu",
             Action::Back => "back",
             Action::Reload => "reload",
+            Action::PrevFilter => "prev_filter",
+            Action::NextFilter => "next_filter",
         }
     }
 }
@@ -94,6 +101,9 @@ impl Bindable for Binding {
             Action::Menu => &["Shift+F10"],
             Action::Back => &["Escape"],
             Action::Reload => &["F5"],
+            // like a browser's tabs; bare Left/Right move around the grid
+            Action::PrevFilter => &["Ctrl+PageUp"],
+            Action::NextFilter => &["Ctrl+PageDown"],
         }
     }
 

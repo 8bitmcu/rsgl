@@ -1,4 +1,5 @@
 use crate::{
+    api_hasheous,
     api_igdb::{self, Meta},
     gamepad::Padmap,
     keys::Keymap,
@@ -10,7 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{OnceLock, RwLock},
 };
 
 /// Config file given with --config. When set, it replaces the default locations,
@@ -42,11 +43,22 @@ enabled = true
 # save the current session every N minutes, 0 only saves when the game exits
 checkpoint_minutes = 5
 
+# Where the cache (covers, heroes, backgrounds, IGDB data) and the playtime file
+# go. A relative path is taken from this file's folder, so rsgl, its config and
+# its data can live together in one portable folder.
+# [paths]
+# cache = "./cache"                            # default ~/.cache/rsgl
+# playtime = "./playtime.toml"                 # default ~/.local/share/rsgl/playtime.toml
+
 [api]
 # steamgriddb_key = "your-key-here"
 # IGDB metadata, from a Twitch app (dev.twitch.tv/console); fills in {year} and {genres}
 # igdb_client_id = "your-client-id"
 # igdb_client_secret = "your-client-secret"
+# identify [[roms]] files by their contents on hasheous.org, for proper names and
+# IGDB and SteamGridDB ids; reads every ROM once to hash it
+# hasheous = false
+# hasheous_url = "http://nas:5000"             # a self-hosted Hasheous, default hasheous.org
 
 # The status bar under the grid. Each part is a text with variables: the game's
 # {title}, {name}, {year}, {genres}, {playtime}, {last_played}, {not_installed}
@@ -68,8 +80,9 @@ checkpoint_minutes = 5
 # the key hint, and its autocomplete suggests names, tags and genres (Tab takes it). Buttons and menu entries run a tool, with [vars] and [env] but
 # not a game's own. A toggle sets an [env] variable to on or off (no off: unset)
 # for whatever is launched next, or with var, one of the [vars] (no off: blank).
-# A sort orders the grid. Leaving out center puts the search there. This is the
-# default:
+# A sort orders the grid. A filter narrows it to a search on top of what's typed,
+# switched with its < > arrows, Ctrl+PageUp/PageDown or LB/RB, and "" shows every
+# game. Leaving out center puts the search there. This is the default:
 # [topbar]
 # left = []
 # center = [{ type = "search" }]
@@ -80,6 +93,11 @@ checkpoint_minutes = 5
 # right = [
 #   { type = "button", title = "Steam", exec = "steam -bigpicture" },
 #   { type = "sort", options = ["name", "last_played", "playtime", "year"], default = "last_played" },
+#   { type = "filter", options = [
+#     { title = "All", filter = "" },
+#     { title = "PC", filter = "t:pc" },
+#     { title = "SNES", filter = "t:snes" },
+#   ] },
 #   { type = "toggle", title = "MangoHud", env = "MANGOHUD", on = "1", off = "0" },
 #   { type = "menu", title = "Tools", entries = [{ title = "Lutris", exec = "lutris" }] },
 # ]
@@ -98,6 +116,8 @@ checkpoint_minutes = 5
 # menu = ["Shift+F10"]                         # open the selected game's right-click menu
 # back = ["Escape"]                            # close the menu, leave the top bar, clear the search, then quit
 # reload = ["F5"]
+# prev_filter = ["Ctrl+PageUp"]                # switch the top bar's filter
+# next_filter = ["Ctrl+PageDown"]
 
 # Gamepad buttons for each action, same rules as [keyboard]. Buttons are named
 # after the Xbox layout and matched by position (A is the bottom face button on
@@ -108,12 +128,14 @@ checkpoint_minutes = 5
 # down = ["DPadDown", "LeftStickDown"]
 # left = ["DPadLeft", "LeftStickLeft"]
 # right = ["DPadRight", "LeftStickRight"]
-# page_up = ["LB"]
-# page_down = ["RB"]
+# page_up = ["LT"]
+# page_down = ["RT"]
 # launch = ["A"]
 # menu = ["Menu"]
 # back = ["B"]
 # reload = ["View"]
+# prev_filter = ["LB"]
+# next_filter = ["RB"]
 
 # Variables: {name} is replaced in name, exec, workdir, cover and env values (and
 # in menu entries). A game's own `vars` override these, and a variable can use
@@ -135,6 +157,36 @@ checkpoint_minutes = 5
 # [[right_click]]
 # title = "Open game folder"
 # action = "open_folder"
+#
+# Entries also get the game's {name}, {grid} and {hero} (the full paths of its
+# cover and hero, blank if none) and {workdir}. An entry's own vars win over the
+# game's, and {exec} is the game's exec as written, so with
+# exec = "{gs} wine game.exe" this runs plain "wine game.exe".
+# [[right_click]]
+# title = "Launch without gamescope"
+# exec = "{exec}"
+# vars = { gs = "" }
+# launch = true
+#
+# for = "game" shows an entry only for [[game]] entries, for = "rom" only for
+# [[roms]] files, so it can use {rom}.
+# [[right_click]]
+# title = "Delete ROM"
+# for = "rom"
+# exec = '''zenity --question --text="Delete {name}?" && rm "{rom}"'''
+
+# Every file in a folder as a game, named after the file without (USA), [!] and
+# such. {rom} is the file's full path; workdir defaults to path.
+# [[roms]]
+# path = "~/roms/snes"
+# extensions = ["sfc", "smc", "zip"]
+# exec = 'retroarch -L ~/.config/retroarch/cores/snes9x_libretro.so "{rom}"'
+# tags = ["snes"]
+# name = "{igdb_name} (SNES)"                 # show IGDB's name instead of the file's
+# igdb_platform = "snes"                      # only match IGDB games on this platform (its slug)
+# files."F-Zero (USA).sfc" = { igdb_id = 1234 } # one file's ids, by file name: igdb_id,
+#                                             # steamgriddb_id, grid_id, hero_id
+# files."bios.sfc" = { hidden = true }        # a file that isn't a game
 
 [[game]]
 name = "Example Game"                          # "Example Game {year}" adds the release year from IGDB
@@ -173,6 +225,8 @@ struct Config {
     #[serde(default)]
     api: ApiCfg,
     #[serde(default)]
+    paths: PathsCfg,
+    #[serde(default)]
     playtime: PlaytimeCfg,
     #[serde(default)]
     keyboard: Keymap,
@@ -192,6 +246,8 @@ struct Config {
     right_click: Vec<MenuCfg>,
     #[serde(default, rename = "game")]
     games: Vec<GameCfg>,
+    #[serde(default)]
+    roms: Vec<RomsCfg>,
 }
 
 /// Everything the window needs from the config file.
@@ -207,6 +263,9 @@ pub struct Settings {
     pub topbar: Topbar,
     /// To build `games` and `topbar` again when a toggle switches a variable.
     pub library: Library,
+    /// `[[roms]]` files to ask Hasheous about: it's on, and they haven't been looked
+    /// up since they last changed.
+    pub unidentified_roms: Vec<PathBuf>,
 }
 
 #[derive(Deserialize, Default)]
@@ -215,6 +274,11 @@ pub struct ApiCfg {
     steamgriddb_key: Option<String>,
     igdb_client_id: Option<String>,
     igdb_client_secret: Option<String>,
+    /// Name `[[roms]]` files by what Hasheous says they are, see `api_hasheous`.
+    pub hasheous: bool,
+    /// A self-hosted Hasheous to ask instead of hasheous.org.
+    #[serde(deserialize_with = "http_url")]
+    hasheous_url: Option<String>,
 }
 
 impl ApiCfg {
@@ -228,6 +292,23 @@ impl ApiCfg {
     pub fn igdb_credentials(&self) -> Option<(String, String)> {
         let id = secret("IGDB_CLIENT_ID", &self.igdb_client_id)?;
         Some((id, secret("IGDB_CLIENT_SECRET", &self.igdb_client_secret)?))
+    }
+
+    /// Where Hasheous's API is: under `hasheous_url`, else on hasheous.org. The URL
+    /// may be given with or without the `/api/v1`.
+    pub fn hasheous_api(&self) -> String {
+        let root = self.hasheous_url.as_deref().unwrap_or("https://hasheous.org").trim_end_matches('/');
+        format!("{}/api/v1", root.strip_suffix("/api/v1").unwrap_or(root))
+    }
+}
+
+/// An http:// or https:// URL with a host.
+fn http_url<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let url = String::deserialize(d)?;
+    let host = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+    match host {
+        Some(h) if !h.trim_start_matches('/').is_empty() => Ok(Some(url)),
+        _ => Err(serde::de::Error::custom(format!("{url:?} isn't an http:// or https:// URL"))),
     }
 }
 
@@ -302,10 +383,178 @@ struct GameCfg {
     vars: BTreeMap<String, toml::Value>,
     #[serde(default)]
     right_click: Vec<MenuCfg>,
+    /// Made by `add_roms` from a `[[roms]]` file, not written as a `[[game]]`.
+    #[serde(skip)]
+    rom: bool,
+    /// What the window shows instead of `name`: a ROM's `[[roms]] name`.
+    #[serde(skip)]
+    title: Option<String>,
+    /// A ROM's `[[roms]] igdb_platform`.
+    #[serde(skip)]
+    igdb_platform: Option<String>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// `[[roms]]`: a folder where every file with one of `extensions` becomes a game,
+/// see `add_roms`. The other keys are like a game's, and `exec` gets the file as `{rom}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RomsCfg {
+    path: String,
+    extensions: Vec<String>,
+    exec: String,
+    /// What the window shows for each file, see `IGDB_NAME`. The game's name (playtime,
+    /// art, --launch) stays the file's either way.
+    name: Option<String>,
+    /// IGDB's slug for the folder's system ("n64"): the IGDB search by name only
+    /// finds games on it, so a remake or port with the same name isn't picked.
+    igdb_platform: Option<String>,
+    /// Defaults to `path`.
+    workdir: Option<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    vars: BTreeMap<String, toml::Value>,
+    /// Settings for single files, by file name, see `RomFileCfg`.
+    #[serde(default)]
+    files: BTreeMap<String, RomFileCfg>,
+}
+
+/// `[[roms]] files."name.ext"`: a file's own ids, for when the lookup by name (or
+/// Hasheous) picks the wrong game, and `hidden` for files that aren't games (BIOS zips).
+/// An id here beats Hasheous's.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RomFileCfg {
+    igdb_id: Option<u64>,
+    steamgriddb_id: Option<u64>,
+    grid_id: Option<u64>,
+    hero_id: Option<u64>,
+    #[serde(default)]
+    hidden: bool,
+}
+
+/// The variable that holds a ROM's full path, see `RomsCfg`.
+const ROM: &str = "rom";
+
+/// What scanning the `[[roms]]` folders found besides the games, see `add_roms`.
+#[derive(Default)]
+struct Scan {
+    warnings: Vec<String>,
+    /// The files `known` has nothing about yet.
+    unidentified: Vec<PathBuf>,
+}
+
+/// Turns every `[[roms]]` folder's files into games in `cfg.games`. A folder that
+/// can't be read (a drive that isn't plugged in) is a warning rather than an error,
+/// so the rest of the library still loads. With `known` (Hasheous is on), a file it
+/// identified gets the game's name and ids from there instead of from its file name.
+fn add_roms(cfg: &mut Config, known: Option<&api_hasheous::Known>) -> Result<Scan, String> {
+    let mut scan = Scan::default();
+    let warnings = &mut scan.warnings;
+    if cfg.roms.is_empty() {
+        return Ok(scan);
+    }
+    let vars = Vars::default().with(&cfg.vars).map_err(|e| format!("[vars]: {e}"))?;
+    for r in std::mem::take(&mut cfg.roms) {
+        let who = format!("[[roms]] {:?}", r.path);
+        if r.extensions.is_empty() {
+            return Err(format!("{who}: extensions is empty"));
+        }
+        if r.igdb_platform.as_ref().is_some_and(|p| p.trim().is_empty()) {
+            return Err(format!("{who}: igdb_platform is empty; leave it out to search every platform"));
+        }
+        let dir = expand(&vars.expand(&r.path).map_err(|e| format!("{who}, path: {e}"))?);
+        if dir.is_empty() {
+            return Err(format!("{who}: path is empty"));
+        }
+        let entries = fs::read_dir(&dir).and_then(|entries| entries.map(|e| Ok(e?.path())).collect::<Result<Vec<_>, _>>());
+        let mut files = match entries {
+            Ok(files) => files,
+            Err(e) => {
+                warnings.push(format!("{who}: can't read {dir}: {e}"));
+                continue;
+            }
+        };
+        files.retain(|f| {
+            let ext = f.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            f.is_file() && r.extensions.iter().any(|want| want.trim_start_matches('.').eq_ignore_ascii_case(ext))
+        });
+        files.sort();
+        for name in r.files.keys() {
+            if !files.iter().any(|f| f.file_name().is_some_and(|n| n == name.as_str())) {
+                warnings.push(format!("{who}, files: there's no {name:?} with one of the extensions in {dir}"));
+            }
+        }
+        let none = RomFileCfg::default();
+        for file in files {
+            let (Some(full), Some(stem)) = (file.to_str(), file.file_stem().and_then(|s| s.to_str())) else {
+                warnings.push(format!("{who}: {} isn't valid UTF-8, skipped", file.display()));
+                continue;
+            };
+            let pin = file.file_name().and_then(|n| n.to_str()).and_then(|n| r.files.get(n)).unwrap_or(&none);
+            let found = match known.map(|k| k.get(&file)) {
+                // a hidden file isn't worth hashing and sending off
+                _ if pin.hidden => None,
+                Some(None) => {
+                    scan.unidentified.push(file.clone());
+                    None
+                }
+                Some(found) => found.flatten(),
+                None => None,
+            };
+            let mut game_vars = r.vars.clone();
+            game_vars.insert(ROM.to_string(), toml::Value::String(literal(full)));
+            cfg.games.push(GameCfg {
+                name: literal(found.map_or(&rom_name(stem), |f| &f.name)),
+                exec: r.exec.clone(),
+                cover: None,
+                workdir: Some(r.workdir.clone().unwrap_or_else(|| literal(&dir))),
+                env: r.env.clone(),
+                playtime: true,
+                hidden: pin.hidden,
+                tags: r.tags.clone(),
+                steam_appid: None,
+                steamgriddb_id: pin.steamgriddb_id.or(found.and_then(|f| f.steamgriddb_id)),
+                grid_id: pin.grid_id,
+                hero_id: pin.hero_id,
+                igdb_id: pin.igdb_id.or(found.and_then(|f| f.igdb_id)),
+                vars: game_vars,
+                right_click: Vec::new(),
+                rom: true,
+                title: r.name.clone(),
+                igdb_platform: r.igdb_platform.as_ref().map(|p| p.trim().to_string()),
+            });
+        }
+    }
+    Ok(scan)
+}
+
+/// A ROM's file stem as a game name, without the `(USA)`, `(Rev 1)` and `[!]` groups
+/// ROM sets add, so SteamGridDB and IGDB find it by name. A stem that's nothing but
+/// groups is kept as it is.
+fn rom_name(stem: &str) -> String {
+    let mut out = String::new();
+    let mut rest = stem;
+    while let Some(start) = rest.find(['(', '[']) {
+        let close = if rest.as_bytes()[start] == b'(' { ')' } else { ']' };
+        let Some(len) = rest[start..].find(close) else { break };
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    let name = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        stem.to_string()
+    } else {
+        name
+    }
 }
 
 /// `[defaults]`: what a game gets for a key it leaves out. Filled in with the game's
@@ -328,8 +577,22 @@ struct MenuCfg {
     workdir: Option<String>,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// On top of the game's variables, for this entry only.
+    #[serde(default)]
+    vars: BTreeMap<String, toml::Value>,
     #[serde(default)]
     launch: bool,
+    /// Which games a top-level entry is shown for; all of them if not set.
+    #[serde(rename = "for")]
+    only_for: Option<Kind>,
+}
+
+/// What a game came from: a `[[game]]`, or a file in a `[[roms]]` folder.
+#[derive(Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Kind {
+    Game,
+    Rom,
 }
 
 /// A top bar button or menu entry. It runs like a right-click tool, but no game is
@@ -402,14 +665,16 @@ pub struct Game {
     /// filled in, except `{year}`, which is left out so the name doesn't change once
     /// the year is known.
     pub name: String,
-    /// What the window shows: the name with `{year}` filled in, once it's known.
+    /// What the window shows: the name (or a ROM's `[[roms]] name`) with `{year}` and
+    /// `{igdb_name}` filled in, once they're known.
     pub title: String,
-    /// The name uses IGDB's `{year}` (the game has no `year` variable of its own).
-    uses_year: bool,
+    /// The title uses IGDB's `{year}` or `{igdb_name}` (the game has no variable of its
+    /// own by that name).
+    uses_igdb: bool,
     /// What IGDB says about the game, once it's been looked up.
     pub meta: Option<Meta>,
-    /// The name as written and the game's variables, to fill in the year later.
-    name_template: String,
+    /// The title as written and the game's variables, to fill in IGDB's data later.
+    title_template: String,
     pub vars: Vars,
     pub exec: String,
     pub cover: Option<PathBuf>,
@@ -432,26 +697,50 @@ pub struct Game {
     pub hero_id: Option<u64>,
     /// Look the game up on IGDB by this id instead of searching its name.
     pub igdb_id: Option<u64>,
+    /// Search IGDB only among games on this platform (a slug). `None` with an
+    /// `igdb_id`, since there's no search then.
+    pub igdb_platform: Option<String>,
+    /// Made from a `[[roms]]` file, see `art_search`.
+    rom: bool,
 }
 
 impl Game {
-    /// Keeps what IGDB found and puts the release year into the title.
+    /// Keeps what IGDB found and puts it into the title.
     pub fn set_meta(&mut self, meta: Meta) {
-        if let Some(year) = meta.year.filter(|_| self.uses_year) {
-            let title = self
-                .vars
-                .with_defaults([(YEAR, year.to_string().as_str())])
-                .expand(&self.name_template)
-                .expect("the name expanded when the config loaded, and a year adds no braces");
-            self.title = tidy(&title);
-        }
         self.meta = Some(meta);
+        self.title = self.shown_title();
+    }
+
+    /// The title with what IGDB has said so far: a blank `{year}`, and `{igdb_name}`
+    /// is the game's name until IGDB has one.
+    fn shown_title(&self) -> String {
+        let meta = self.meta.as_ref();
+        let year = meta.and_then(|m| m.year).map(|y| y.to_string()).unwrap_or_default();
+        let igdb_name = meta.and_then(|m| m.name.as_deref()).unwrap_or(&self.name);
+        let title = self
+            .vars
+            .with_defaults([(YEAR, year.as_str()), (IGDB_NAME, igdb_name)])
+            .expand(&self.title_template)
+            .expect("the title expanded when the config loaded, and IGDB's values add no braces");
+        if self.uses_igdb {
+            tidy(&title)
+        } else {
+            title
+        }
     }
 
     /// Whether something shown needs the game's IGDB data: it hasn't been looked up
-    /// yet, and its name uses `{year}` or `status_uses_igdb` (see `Status::uses_igdb`).
+    /// yet, and its title uses it or `status_uses_igdb` (see `Status::uses_igdb`).
     pub fn needs_meta(&self, status_uses_igdb: bool) -> bool {
-        self.meta.is_none() && (self.uses_year || status_uses_igdb)
+        self.meta.is_none() && (self.uses_igdb || status_uses_igdb)
+    }
+
+    /// What to search SteamGridDB for instead of the name. A ROM's name is only its
+    /// file's, so IGDB's name for it finds art more often ("1080 Snowboarding" is
+    /// "1080° Snowboarding"). A `[[game]]`'s name was written to be found, so it's kept.
+    pub fn art_search(&self) -> Option<&str> {
+        let igdb = self.meta.as_ref()?.name.as_deref()?;
+        (self.rom && !igdb.eq_ignore_ascii_case(&self.name)).then_some(igdb)
     }
 
     /// False when the game's workdir is set but doesn't exist, which usually means the
@@ -480,6 +769,20 @@ impl std::fmt::Display for ArtId {
 
 /// The variable that holds the game's release year, available in `name` and the status bar.
 pub const YEAR: &str = "year";
+
+/// IGDB's name for the game, available in a `[[roms]] name`. Not in a `[[game]]`'s: its
+/// name is what IGDB is searched for, and who the game is, so it can't come from IGDB.
+const IGDB_NAME: &str = "igdb_name";
+
+/// The variable that holds the game's `exec` as written, available in its menu entries.
+const GAME_EXEC: &str = "exec";
+
+/// What a game's menu entries also get: its name (without `{year}`), the cover and hero
+/// files it has (blank until there's one) and its workdir, see `build_game`.
+const GAME_NAME: &str = "name";
+const GAME_GRID: &str = "grid";
+const GAME_HERO: &str = "hero";
+const GAME_WORKDIR: &str = "workdir";
 
 /// `{env:NAME}` is environment variable NAME, see `Vars::expand_env`.
 const ENV_PREFIX: &str = "env:";
@@ -542,9 +845,46 @@ fn native_slashes(s: &str) -> String {
     s.to_string()
 }
 
-/// Everything rsgl downloads or generates lives under ~/.cache/rsgl.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PathsCfg {
+    cache: Option<String>,
+    playtime: Option<String>,
+}
+
+/// [paths] resolved; `None` is the default location.
+#[derive(Debug, PartialEq)]
+struct Paths {
+    cache: Option<PathBuf>,
+    playtime: Option<PathBuf>,
+}
+
+/// Set from [paths] by every load, so F5 picks up a change too.
+static PATHS: RwLock<Paths> = RwLock::new(Paths { cache: None, playtime: None });
+
+impl PathsCfg {
+    /// Expands `~` and takes relative paths from `base`, the config file's folder, so a
+    /// portable setup works no matter which folder rsgl is started from.
+    fn resolve(&self, base: &Path) -> Result<Paths, String> {
+        let path = |key, value: &Option<String>| match value.as_deref() {
+            None => Ok(None),
+            Some("") => Err(format!("[paths]: {key} is empty")),
+            Some(s) => Ok(Some(base.join(expand(s)))),
+        };
+        Ok(Paths { cache: path("cache", &self.cache)?, playtime: path("playtime", &self.playtime)? })
+    }
+}
+
+/// The folder of the config file at `path`, which relative [paths] start from.
+fn config_folder(path: &Path) -> Result<PathBuf, String> {
+    let abs = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(abs.parent().expect("an absolute file path has a parent").to_path_buf())
+}
+
+/// Everything rsgl downloads or generates lives under ~/.cache/rsgl, or [paths] cache.
 fn cache_dir() -> PathBuf {
-    directories::BaseDirs::new().unwrap().cache_dir().join("rsgl")
+    let configured = PATHS.read().unwrap().cache.clone();
+    configured.unwrap_or_else(|| directories::BaseDirs::new().unwrap().cache_dir().join("rsgl"))
 }
 
 pub fn covers_dir() -> PathBuf {
@@ -569,9 +909,33 @@ pub fn igdb_meta_file() -> PathBuf {
     cache_dir().join("igdb_meta.toml")
 }
 
-/// Playtime is kept under ~/.local/share/rsgl, since unlike the cache it can't be rebuilt.
+/// Which ROM files Hasheous identified, by path.
+pub fn hasheous_file() -> PathBuf {
+    cache_dir().join("hasheous.toml")
+}
+
+/// Writes `text` to `path` through a temporary file, so a half-written file is never
+/// read. `owner_only` makes it readable by its owner only (on Unix).
+pub fn write_file(path: &Path, text: &str, owner_only: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension("part");
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if owner_only {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    }
+    opts.open(&tmp)?.write_all(text.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Playtime is kept under ~/.local/share/rsgl (or [paths] playtime), since unlike the
+/// cache it can't be rebuilt.
 pub fn playtime_file() -> PathBuf {
-    directories::BaseDirs::new().unwrap().data_dir().join("rsgl/playtime.toml")
+    let configured = PATHS.read().unwrap().playtime.clone();
+    configured.unwrap_or_else(|| directories::BaseDirs::new().unwrap().data_dir().join("rsgl/playtime.toml"))
 }
 
 /// Lock file for single instance mode, in $XDG_RUNTIME_DIR if there is one.
@@ -606,10 +970,18 @@ pub fn find_hero(name: &str) -> Option<PathBuf> {
 }
 
 /// Config locations in priority order:
-/// 1. $XDG_CONFIG_HOME/rsgl/rsgl.toml (usually ~/.config/rsgl/rsgl.toml;
+/// 1. rsgl.toml next to the executable, for a portable folder
+/// 2. $XDG_CONFIG_HOME/rsgl/rsgl.toml (usually ~/.config/rsgl/rsgl.toml;
 ///    on Windows %APPDATA%\rsgl\rsgl.toml)
-/// 2. ~/.rsgl.toml
+/// 3. ~/.rsgl.toml
 fn candidates() -> Vec<PathBuf> {
+    let beside_exe = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("rsgl.toml")));
+    beside_exe.into_iter().chain(home_candidates()).collect()
+}
+
+/// The default locations in the user's home. The example config is written to the
+/// first one, never next to the executable, which may be read-only (/usr/bin).
+fn home_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(d) = directories::BaseDirs::new() {
         v.push(d.config_dir().join("rsgl/rsgl.toml"));
@@ -658,7 +1030,7 @@ fn read_and_warn(path: &Path) -> Result<Config, String> {
 /// first location and returns an error telling the user about it.
 pub fn load() -> Result<Settings, String> {
     let Some(path) = locate()? else {
-        let candidates = candidates();
+        let candidates = home_candidates();
         let target = candidates
             .first()
             .ok_or("could not determine the home directory")?;
@@ -671,19 +1043,35 @@ pub fn load() -> Result<Settings, String> {
             target.display()
         ));
     };
-    build(read_and_warn(&path)?, api_igdb::cached_meta()).map_err(|e| format!("{}: {e}", path.display()))
+    load_from(&path)
 }
 
 /// Like `load`, for commands that run without a window: a missing config is just
 /// an error, and nothing is written to disk.
 pub fn load_existing() -> Result<Settings, String> {
     let path = locate()?.ok_or_else(no_config)?;
-    build(read_and_warn(&path)?, api_igdb::cached_meta()).map_err(|e| format!("{}: {e}", path.display()))
+    load_from(&path)
+}
+
+/// Reads the config at `path`, switches to its [paths], scans the [[roms]] folders,
+/// then builds the settings.
+fn load_from(path: &Path) -> Result<Settings, String> {
+    let mut cfg = read_and_warn(path)?;
+    let at = |e| format!("{}: {e}", path.display());
+    *PATHS.write().unwrap() = cfg.paths.resolve(&config_folder(path)?).map_err(at)?;
+    // after the switch, so the Hasheous and IGDB data come from the configured cache
+    let known = cfg.api.hasheous.then(api_hasheous::cached);
+    let scan = add_roms(&mut cfg, known.as_ref()).map_err(at)?;
+    for w in scan.warnings {
+        eprintln!("rsgl: {}: {w}", path.display());
+    }
+    let settings = build(cfg, api_igdb::cached_meta()).map_err(at)?;
+    Ok(Settings { unidentified_roms: scan.unidentified, ..settings })
 }
 
 fn no_config() -> String {
     let places: Vec<String> = candidates().iter().map(|p| p.display().to_string()).collect();
-    format!("no config file found (looked for {})", places.join(" and "))
+    format!("no config file found (looked for {})", places.join(", "))
 }
 
 /// Values for `{name}` placeholders: the global `[vars]` with a game's own `vars` on top.
@@ -721,6 +1109,14 @@ impl Vars {
         for (name, value) in pairs {
             map.entry(name.to_string()).or_insert_with(|| literal(value));
         }
+        Vars(map)
+    }
+
+    /// These variables with `name` set to `template`, unless it's already set. Unlike
+    /// `with_defaults`, `template` is expanded like any other value.
+    fn with_template_default(&self, name: &str, template: &str) -> Vars {
+        let mut map = self.0.clone();
+        map.entry(name.to_string()).or_insert_with(|| template.to_string());
         Vars(map)
     }
 
@@ -815,6 +1211,7 @@ fn menu_entry(
     vars: &Vars,
 ) -> Result<MenuEntry, String> {
     let err = |msg: String| format!("{owner}, entry {:?}: {msg}", m.title);
+    let vars = vars.with(&m.vars).map_err(|e| err(format!("vars: {e}")))?;
     let sub = |field: &str, s: &str| vars.expand(s).map_err(|e| err(format!("{field}: {e}")));
 
     let action = match (&m.exec, m.action.as_deref()) {
@@ -858,7 +1255,16 @@ pub fn global_env(env: &BTreeMap<String, String>, vars: &Vars, who: &str) -> Res
 pub fn tool(t: ToolCfg, owner: &str, vars: &Vars, env: &BTreeMap<String, String>) -> Result<MenuEntry, String> {
     // [env] is fine for every game, so a variable missing here is one only games have
     let env = global_env(env, vars, owner).map_err(|e| format!("{e} (the top bar only has [vars], not a game's own)"))?;
-    let m = MenuCfg { title: t.title, exec: Some(t.exec), action: None, workdir: t.workdir, env: t.env, launch: false };
+    let m = MenuCfg {
+        title: t.title,
+        exec: Some(t.exec),
+        action: None,
+        workdir: t.workdir,
+        env: t.env,
+        vars: BTreeMap::new(),
+        launch: false,
+        only_for: None,
+    };
     menu_entry(&m, owner, None, &env, vars)
 }
 
@@ -892,7 +1298,7 @@ pub struct Library {
 }
 
 impl Library {
-    /// The games and the top bar, with the top bar's toggles on and off like those of
+    /// The games and the top bar, with the top bar's toggles and sort like those of
     /// `toggles` (a top bar from this library), or as the config starts them.
     pub fn build(&self, toggles: Option<&Topbar>) -> Result<(Vec<Game>, Topbar), String> {
         let vars = Vars::default().with(&self.vars).map_err(|e| format!("[vars]: {e}"))?;
@@ -912,8 +1318,8 @@ impl Library {
     }
 }
 
-/// The top bar, and `vars` with the values its toggles give variables. The toggles are
-/// on and off like those of `states`, or as they start.
+/// The top bar, and `vars` with the values its toggles give variables. The toggles and
+/// sort are like those of `states`, or as they start.
 fn topbar_and_vars(
     cfg: &TopbarCfg,
     check: &Checker,
@@ -933,7 +1339,7 @@ fn topbar_and_vars(
     // built again, so buttons and menus see the toggled values too
     let vars = vars.with_values(states.var_values());
     let mut topbar = new(&vars)?;
-    topbar.copy_toggles(states);
+    topbar.copy_state(states);
     Ok((topbar, vars))
 }
 
@@ -969,6 +1375,7 @@ fn build(cfg: Config, meta: BTreeMap<String, Meta>) -> Result<Settings, String> 
         status,
         topbar,
         library,
+        unidentified_roms: Vec::new(),
     })
 }
 
@@ -980,6 +1387,9 @@ fn build_game(g: GameCfg, shared: &Shared) -> Result<Game, String> {
     // {year} only exists in the name, and a game's own `year` variable wins over IGDB's.
     // Expanding with two different years tells whether the name uses it at all.
     let name_with = |year: &str| vars.with_defaults([(YEAR, year)]).expand(&g.name).map_err(|e| format!("{who}, name: {e}"));
+    if !vars.has(IGDB_NAME) && name_with("").is_err() && vars.with_defaults([(YEAR, ""), (IGDB_NAME, "")]).expand(&g.name).is_ok() {
+        return Err(format!("{who}, name: {{{IGDB_NAME}}} only works in a [[roms]] name"));
+    }
     let blank = name_with("")?;
     let uses_year = name_with("0")? != blank;
     let name = if uses_year { tidy(&blank) } else { blank };
@@ -994,8 +1404,23 @@ fn build_game(g: GameCfg, shared: &Shared) -> Result<Game, String> {
             return Err(format!("{who}, name: can't use {{{var}}}, a top bar toggle switches it"));
         }
     }
-    // data cached under another igdb_id (or by name, before one was set) is stale
-    let meta = shared.meta.get(&name).filter(|m| m.igdb_id == g.igdb_id).cloned();
+    // a ROM's title can come from `[[roms]] name`; a game's is its name. Either may use
+    // IGDB's data, and expanding with two different values tells whether it does
+    let title_template = g.title.clone().unwrap_or_else(|| g.name.clone());
+    let title_with = |year: &str, igdb_name: &str| {
+        vars.with_defaults([(YEAR, year), (IGDB_NAME, igdb_name)]).expand(&title_template).map_err(|e| format!("{who}, name: {e}"))
+    };
+    let uses_igdb = title_with("0", "x")? != title_with("", "")?;
+
+    // data cached under another igdb_id or igdb_platform (or by name, before one was set)
+    // is stale, and so is a ROM's from before IGDB's names were kept, since its title and
+    // art may use it
+    let igdb_platform = g.igdb_platform.filter(|_| g.igdb_id.is_none());
+    let meta = shared
+        .meta
+        .get(&name)
+        .filter(|m| m.igdb_id == g.igdb_id && m.igdb_platform == igdb_platform && (!g.rom || m.name.is_some()))
+        .cloned();
 
     let exec = expand(&sub("exec", &g.exec)?);
     // the game's own workdir wins over [defaults], and one that comes out empty is none
@@ -1024,23 +1449,38 @@ fn build_game(g: GameCfg, shared: &Shared) -> Result<Game, String> {
         .transpose()?
         .map(|c| PathBuf::from(expand(&c)))
         .filter(|p| p.exists())
-        .or_else(|| find_cover(&g.name));
+        .or_else(|| find_cover(&name));
 
-    // shared entries first, then the game's own; both see this game's variables
+    // shared entries first, then the game's own; both see this game's variables, and
+    // {exec} is the game's exec as written, so an entry's own vars reach into it.
+    // A variable of the game's own with one of these names wins, like for {year}
+    let text = |p: Option<&Path>| p.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let (grid, hero, wd) = (text(cover.as_deref()), text(find_hero(&name).as_deref()), text(workdir.as_deref()));
+    let menu_vars = vars.with_template_default(GAME_EXEC, &g.exec).with_defaults([
+        (GAME_NAME, name.as_str()),
+        (GAME_GRID, &grid),
+        (GAME_HERO, &hero),
+        (GAME_WORKDIR, &wd),
+    ]);
     let mut menu = Vec::new();
     let shared_owner = format!("[[right_click]] (for {who})");
-    for m in shared.menu {
-        menu.push(menu_entry(m, &shared_owner, workdir.as_deref(), &env, &vars)?);
+    let kind = if g.rom { Kind::Rom } else { Kind::Game };
+    // an entry for the other kind isn't built at all, so it may use variables this game lacks
+    for m in shared.menu.iter().filter(|m| m.only_for.is_none_or(|k| k == kind)) {
+        menu.push(menu_entry(m, &shared_owner, workdir.as_deref(), &env, &menu_vars)?);
     }
     for m in &g.right_click {
-        menu.push(menu_entry(m, &who, workdir.as_deref(), &env, &vars)?);
+        if m.only_for.is_some() {
+            return Err(format!("{who}, entry {:?}: `for` only works in a top-level [[right_click]]", m.title));
+        }
+        menu.push(menu_entry(m, &who, workdir.as_deref(), &env, &menu_vars)?);
     }
 
     let mut game = Game {
-        title: name.clone(),
-        uses_year,
+        title: String::new(),
+        uses_igdb,
         meta: None,
-        name_template: g.name,
+        title_template,
         vars,
         name,
         exec,
@@ -1064,17 +1504,19 @@ fn build_game(g: GameCfg, shared: &Shared) -> Result<Game, String> {
         grid_id: g.grid_id,
         hero_id: g.hero_id,
         igdb_id: g.igdb_id,
+        igdb_platform,
+        rom: g.rom,
     };
-    if let Some(m) = meta {
-        game.set_meta(m);
-    }
+    game.meta = meta;
+    game.title = game.shown_title();
     Ok(game)
 }
 
 /// The games in config `text`, for tests elsewhere.
 #[cfg(test)]
 pub fn parse_games(text: &str) -> Result<Vec<Game>, String> {
-    let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+    let mut cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+    add_roms(&mut cfg, None)?;
     build(cfg, BTreeMap::new()).map(|s| s.games)
 }
 
@@ -1095,19 +1537,27 @@ pub struct Report {
 pub fn check() -> Result<Report, String> {
     let path = locate()?.ok_or_else(no_config)?;
     let (cfg, unknown) = read(&path)?;
+    let paths = cfg.paths.resolve(&config_folder(&path)?);
     let mut report = check_config(cfg);
+    report.errors.extend(paths.err());
     report.warnings.extend(unknown);
     report.path = path;
     Ok(report)
 }
 
 fn check_config(mut cfg: Config) -> Report {
+    let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    // without Hasheous's names: what's checked is the config, not what Hasheous said
+    match add_roms(&mut cfg, None) {
+        Ok(scan) => warnings = scan.warnings,
+        Err(e) => errors.push(e),
+    }
     let mut report = Report {
         path: PathBuf::new(),
         games: cfg.games.len(),
         hidden: cfg.games.iter().filter(|g| g.hidden).count(),
-        errors: Vec::new(),
-        warnings: Vec::new(),
+        errors,
+        warnings,
     };
     let check = Checker::new(&var_names(&cfg));
     if let Err(e) = Status::new(std::mem::take(&mut cfg.status), &check) {
@@ -1121,7 +1571,10 @@ fn check_config(mut cfg: Config) -> Report {
         }
     };
     let (vars, var_toggles) = match topbar_and_vars(&cfg.topbar, &check, &vars, &cfg.env, None) {
-        Ok((topbar, vars)) => (vars, topbar.var_toggles()),
+        Ok((topbar, vars)) => {
+            report.warnings.extend(unmatched_filter_tags(&topbar, &cfg.games));
+            (vars, topbar.var_toggles())
+        }
         Err(e) => {
             report.errors.push(e);
             (vars, Vec::new())
@@ -1171,22 +1624,44 @@ fn check_config(mut cfg: Config) -> Report {
     report
 }
 
-/// The game for `--show`: an exact name (any case), or a name containing `query`
-/// if only one does.
-pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, String> {
-    let q = query.to_lowercase();
-    if let Some(g) = games.iter().find(|g| g.name.to_lowercase() == q) {
-        return Ok(g);
+/// A warning for each `t:` tag in the top bar's filters that no game that isn't hidden
+/// has, which is likely a typo: that filter always shows an empty grid. `g:` can't be
+/// checked, since genres come from IGDB.
+fn unmatched_filter_tags(topbar: &Topbar, games: &[GameCfg]) -> Vec<String> {
+    let Some(filter) = topbar.filter_widget() else { return Vec::new() };
+    let tags: Vec<String> = games.iter().filter(|g| !g.hidden).flat_map(|g| &g.tags).map(|t| t.trim().to_lowercase()).collect();
+    let mut warnings = Vec::new();
+    for o in &filter.options {
+        // a tag matches from its start, like in the search box
+        for t in o.query.tags.iter().filter(|t| !tags.iter().any(|tag| tag.starts_with(t.as_str()))) {
+            warnings.push(format!("[topbar]: filter {:?}: no game has a tag t:{t} matches", o.title));
+        }
     }
-    let hits: Vec<&Game> = games.iter().filter(|g| g.name.to_lowercase().contains(&q)).collect();
+    warnings
+}
+
+/// Which of `names` the command line means by `query`: the one that's exactly it (any
+/// case), or the one containing it if only one does. Otherwise the error has every name
+/// containing it, so none or several.
+pub fn pick<'a>(names: &[&'a str], query: &str) -> Result<usize, Vec<&'a str>> {
+    let q = query.to_lowercase();
+    if let Some(k) = names.iter().position(|n| n.to_lowercase() == q) {
+        return Ok(k);
+    }
+    let hits: Vec<usize> = (0..names.len()).filter(|&k| names[k].to_lowercase().contains(&q)).collect();
     match hits.as_slice() {
-        [g] => Ok(g),
-        [] => Err(format!("no game matches {query:?} (hidden games aren't loaded)")),
-        many => Err(format!(
-            "{query:?} matches {} games: {}",
-            many.len(),
-            many.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", ")
-        )),
+        &[k] => Ok(k),
+        many => Err(many.iter().map(|&k| names[k]).collect()),
+    }
+}
+
+/// The game for `--show` and `--launch`, see `pick`.
+pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, String> {
+    let names: Vec<&str> = games.iter().map(|g| g.name.as_str()).collect();
+    match pick(&names, query) {
+        Ok(k) => Ok(&games[k]),
+        Err(none) if none.is_empty() => Err(format!("no game matches {query:?} (hidden games aren't loaded)")),
+        Err(many) => Err(format!("{query:?} matches {} games: {}", many.len(), many.join(", "))),
     }
 }
 
@@ -1238,6 +1713,13 @@ mod tests {
 
     fn games(text: &str) -> Result<Vec<Game>, String> {
         parse_games(text)
+    }
+
+    #[test]
+    fn config_next_to_exe_comes_first() {
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        assert_eq!(candidates().first(), Some(&exe_dir.join("rsgl.toml")));
+        assert!(!home_candidates().iter().any(|p| p.starts_with(&exe_dir)));
     }
 
     #[test]
@@ -1466,6 +1948,94 @@ workdir = "/w/{dir}"
         assert_eq!(a.menu[0].env.all["D"], "Quake");
         assert_eq!(a.menu[1].action, MenuAction::Exec("tool Quake".into()));
         assert_eq!(a.menu[1].workdir, Some(PathBuf::from("/w/Quake")));
+    }
+
+    #[test]
+    fn a_menu_entry_reruns_the_games_exec_with_its_own_vars() {
+        let g = games(
+            r#"
+[vars]
+gs = "gamescope -w {w} --"
+w = 3440
+
+[[right_click]]
+title = "No gamescope"
+exec = "{exec}"
+vars = { gs = "" }
+launch = true
+
+[[game]]
+name = "A"
+exec = "{gs} wine a.exe"
+vars = { gs = "gs-a" }
+
+[[game.right_click]]
+title = "Narrow"
+exec = "{exec} -windowed"
+vars = { w = 1920 }
+
+[[game]]
+name = "B"
+exec = "{gs} wine b.exe"
+"#,
+        )
+        .unwrap();
+        let (a, b) = (&g[0], &g[1]);
+        assert_eq!(a.exec, "gs-a wine a.exe");
+        // the entry's vars win over the game's own
+        assert_eq!(a.menu[0].action, MenuAction::Exec(" wine a.exe".into()));
+        assert_eq!(a.menu[1].action, MenuAction::Exec("gs-a wine a.exe -windowed".into()));
+        assert_eq!(b.exec, "gamescope -w 3440 -- wine b.exe");
+        assert_eq!(b.menu[0].action, MenuAction::Exec(" wine b.exe".into()));
+
+        // only menu entries have {exec}
+        let e = game_err("[[game]]\nname = \"A\"\nexec = \"{exec}\"\n");
+        assert!(e.contains("{exec} isn't defined"), "{e}");
+        let e = game_err("[[right_click]]\ntitle = \"T\"\nexec = \"t\"\nvars = { v = [1] }\n[[game]]\nname = \"A\"\nexec = \"a\"\n");
+        assert!(e.contains("entry \"T\": vars: v must be"), "{e}");
+    }
+
+    #[test]
+    fn menu_entries_get_the_games_name_art_and_workdir() {
+        let cache = std::env::temp_dir().join(format!("rsgl-menu-vars-test-{}", std::process::id()));
+        let (cover, hero) = (cache.join("covers/rsgl_menu_test.png"), cache.join("heroes/rsgl_menu_test.jpg"));
+        for f in [&cover, &hero] {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "").unwrap();
+        }
+        // only this test's game has art there, so the other tests don't notice
+        PATHS.write().unwrap().cache = Some(cache.clone());
+        let g = games(
+            r#"
+[[right_click]]
+title = "T"
+exec = "t '{name}' {grid} {hero} {workdir}"
+
+[[game]]
+name = "Rsgl {x} Test {year}"
+exec = "a"
+workdir = "/g/{x}"
+vars = { x = "Menu" }
+
+[[game]]
+name = "B"
+exec = "b"
+vars = { hero = "mine" }
+"#,
+        );
+        PATHS.write().unwrap().cache = None;
+        fs::remove_dir_all(&cache).unwrap();
+        let g = g.unwrap();
+        let (b, test) = (&g[0], &g[1]);
+
+        // the art is found by the name without {year}, which is also what downloads are saved as
+        assert_eq!(test.cover.as_ref(), Some(&cover));
+        let want = format!("t 'Rsgl Menu Test' {} {} /g/Menu", cover.display(), hero.display());
+        assert_eq!(test.menu[0].action, MenuAction::Exec(want));
+        // no art or workdir yet is blank, and the game's own variable wins
+        assert_eq!(b.menu[0].action, MenuAction::Exec("t 'B'  mine ".into()));
+        // they're only for menu entries, like {exec}
+        assert!(game_err("[[game]]\nname = \"A\"\nexec = \"{grid}\"\n").contains("{grid} isn't defined"));
     }
 
     #[test]
@@ -1707,6 +2277,24 @@ exec = "a"
     }
 
     #[test]
+    fn paths_are_taken_from_the_config_folder() {
+        let paths = |text: &str| parse(text).unwrap().0.paths.resolve(Path::new("/usb/rsgl"));
+        assert_eq!(paths("").unwrap(), Paths { cache: None, playtime: None }, "unset keeps the defaults");
+        let p = paths("[paths]\ncache = \"./cache\"\nplaytime = \"/data/playtime.toml\"").unwrap();
+        assert_eq!(p.cache, Some(PathBuf::from("/usb/rsgl/./cache")));
+        assert_eq!(p.playtime, Some(PathBuf::from("/data/playtime.toml")), "an absolute path is kept");
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_path_buf();
+        assert_eq!(paths("[paths]\ncache = \"~/rsgl\"").unwrap().cache, Some(home.join("rsgl")));
+        assert_eq!(paths("[paths]\nplaytime = \"\"").unwrap_err(), "[paths]: playtime is empty");
+    }
+
+    #[test]
+    fn config_folder_of_a_relative_path_is_absolute() {
+        let folder = config_folder(Path::new("rsgl.toml")).unwrap();
+        assert_eq!(folder, std::env::current_dir().unwrap());
+    }
+
+    #[test]
     fn check_reports_every_problem_hidden_games_included() {
         let dir = std::env::temp_dir();
         let r = checked(&format!(
@@ -1754,6 +2342,41 @@ workdir = "/also/not/here"
         let r = checked("[vars]\nx = [1]\n[[game]]\nname = \"A\"\nexec = \"a\"\n");
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("[vars]"));
+    }
+
+    #[test]
+    fn check_warns_about_filter_tags_no_game_has() {
+        let r = checked(
+            r#"
+[topbar]
+left = [{ type = "filter", options = [
+  { title = "All", filter = "" },
+  { title = "LAN", filter = "t:pc t:LAN quake g:shooter" },
+  { title = "NES", filter = "t:nes" },
+  { title = "Old", filter = "t:old" },
+] }]
+
+[[game]]
+name = "Quake"
+exec = "a"
+tags = ["pc", "lan-party"]
+
+[[game]]
+name = "Hidden"
+exec = "a"
+tags = ["old"]
+hidden = true
+"#,
+        );
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            r.warnings,
+            [
+                "[topbar]: filter \"NES\": no game has a tag t:nes matches",
+                "[topbar]: filter \"Old\": no game has a tag t:old matches",
+            ],
+            "tags match from their start, any case; a hidden game isn't shown"
+        );
     }
 
     #[test]
@@ -1915,6 +2538,17 @@ exec = "c"
     }
 
     #[test]
+    fn building_again_for_a_var_toggle_keeps_the_sort() {
+        let text = VAR_TOGGLE.replace("left = [", r#"left = [{ type = "sort", options = ["name", "year"] },"#);
+        let s = build(toml::from_str(&text).unwrap(), BTreeMap::new()).unwrap();
+        let mut on = s.topbar;
+        on.set_sort((0, 0), 1);
+        on.flip((0, 1));
+        let (_, topbar) = s.library.build(Some(&on)).unwrap();
+        assert_eq!(topbar.sort(), crate::topbar::SortBy::Year);
+    }
+
+    #[test]
     fn a_var_toggle_starts_from_vars_and_its_off_value_applies_from_the_start() {
         let text = VAR_TOGGLE.replace("mango = \"\"", "mango = \" --mangoapp\"");
         let s = build(toml::from_str(&text).unwrap(), BTreeMap::new()).unwrap();
@@ -1936,5 +2570,303 @@ exec = "c"
         assert!(build(toml::from_str(&text).unwrap(), BTreeMap::new()).is_ok(), "its own mango, the toggle doesn't reach it");
         let report = check_config(toml::from_str(&VAR_TOGGLE.replace("name = \"G\"", "name = \"G{mango}\"")).unwrap());
         assert!(report.errors.iter().any(|e| e.contains("can't use {mango}")), "{:?}", report.errors);
+    }
+    #[test]
+    fn rom_names_drop_region_and_dump_groups() {
+        assert_eq!(rom_name("Super Mario World (USA) [!]"), "Super Mario World");
+        assert_eq!(rom_name("Zelda (Europe) (Rev 1) - Extra"), "Zelda - Extra");
+        assert_eq!(rom_name("Doom (unclosed"), "Doom (unclosed");
+        assert_eq!(rom_name("(USA)"), "(USA)", "nothing but groups is kept");
+    }
+
+    #[test]
+    fn roms_become_games_with_rom_workdir_vars_and_env() {
+        let dir = std::env::temp_dir().join(format!("rsgl-roms-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub.sfc")).unwrap();
+        for f in ["Super Mario World (USA).sfc", "F-Zero {x} [!].SMC", "readme.txt", "noext"] {
+            fs::write(dir.join(f), "").unwrap();
+        }
+        let text = format!(
+            r#"
+[vars]
+cores = "/cores"
+roms = {:?}
+[env]
+G = "global"
+
+[[right_click]]
+title = "Shared"
+exec = "{{exec}} --menu"
+
+[[roms]]
+path = "{{roms}}"
+extensions = ["sfc", ".smc"]
+exec = 'retroarch -L {{cores}}/snes9x.so "{{rom}}"'
+tags = ["snes"]
+env = {{ R = "rom" }}
+"#,
+            dir.to_str().unwrap()
+        );
+        let g = games(&text).unwrap();
+        let names: Vec<_> = g.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["F-Zero {x}", "Super Mario World"], "other extensions and folders are skipped");
+
+        let smw = &g[1];
+        let rom = dir.join("Super Mario World (USA).sfc");
+        assert_eq!(smw.exec, format!("retroarch -L /cores/snes9x.so \"{}\"", rom.display()));
+        assert_eq!(smw.workdir.as_deref(), Some(dir.as_path()), "workdir defaults to the folder");
+        assert_eq!(smw.tags, ["snes"]);
+        assert_eq!((smw.env.all["G"].as_str(), smw.env.all["R"].as_str()), ("global", "rom"));
+        assert_eq!(smw.menu[0].action, MenuAction::Exec(format!("{} --menu", smw.exec)), "[[right_click]] applies");
+        assert!(g[0].exec.contains("F-Zero {x} [!].SMC"), "braces in file names are literal");
+
+        let with_workdir = text.replace("tags = ", "workdir = \"/run\"\ntags = ");
+        assert_eq!(games(&with_workdir).unwrap()[0].workdir, Some(PathBuf::from("/run")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn right_click_for_picks_games_or_roms() {
+        let dir = std::env::temp_dir().join(format!("rsgl-roms-for-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Zelda.nes"), "").unwrap();
+        let text = format!(
+            r#"
+[[right_click]]
+title = "Open folder"
+action = "open_folder"
+
+[[right_click]]
+title = "Uninstall"
+for = "game"
+exec = "rm -rf {{path}}"
+
+[[right_click]]
+title = "Delete ROM"
+for = "rom"
+exec = 'rm "{{rom}}"'
+
+[[game]]
+name = "Quake"
+exec = "quake"
+vars = {{ path = "quake" }}
+
+[[roms]]
+path = {:?}
+extensions = ["nes"]
+exec = "nestopia"
+"#,
+            dir.to_str().unwrap()
+        );
+        let g = games(&text).unwrap();
+        let titles = |name: &str| -> Vec<String> {
+            g.iter().find(|g| g.name == name).unwrap().menu.iter().map(|m| m.title.clone()).collect()
+        };
+        assert_eq!(titles("Quake"), ["Open folder", "Uninstall"]);
+        assert_eq!(titles("Zelda"), ["Open folder", "Delete ROM"], "and {{path}} isn't needed for ROMs");
+        let report = check_config(toml::from_str(&text).unwrap());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let e = game_err(&text.replace("for = \"rom\"", "for = \"roms\""));
+        assert!(e.contains("unknown variant `roms`"), "{e}");
+        let e = game_err("[[game]]\nname = \"A\"\nexec = \"a\"\n[[game.right_click]]\ntitle = \"T\"\nexec = \"t\"\nfor = \"game\"\n");
+        assert!(e.contains("`for` only works in a top-level [[right_click]]"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hasheous_url_takes_the_server_with_or_without_the_api_path() {
+        let api = |text: &str| parse(&format!("[api]\n{text}")).map(|(c, _)| c.api.hasheous_api());
+        assert_eq!(api("").unwrap(), "https://hasheous.org/api/v1");
+        assert_eq!(api("hasheous_url = \"http://nas:5000\"").unwrap(), "http://nas:5000/api/v1");
+        assert_eq!(api("hasheous_url = \"http://nas:5000/\"").unwrap(), "http://nas:5000/api/v1");
+        assert_eq!(api("hasheous_url = \"https://h.lan/x/api/v1/\"").unwrap(), "https://h.lan/x/api/v1");
+        for bad in ["nas:5000", "ftp://nas", "https://", ""] {
+            let e = api(&format!("hasheous_url = \"{bad}\"")).unwrap_err().to_string();
+            assert!(e.contains("isn't an http:// or https:// URL"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn hasheous_names_the_roms_it_identified() {
+        let dir = std::env::temp_dir().join(format!("rsgl-roms-hasheous-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let [smw, homebrew, new] = ["smw.sfc", "Homebrew (PD).sfc", "New {x} (USA).sfc"].map(|f| dir.join(f));
+        for f in [&smw, &homebrew, &new] {
+            fs::write(f, "").unwrap();
+        }
+        let text = format!("[[roms]]\npath = {:?}\nextensions = [\"sfc\"]\nexec = \"x\"\n", dir.to_str().unwrap());
+        let found = api_hasheous::Found { name: "Super Mario World {1}".into(), igdb_id: Some(1070), steamgriddb_id: Some(36886) };
+        let known = api_hasheous::Known::of(&[(&smw, Some(found)), (&homebrew, None)]);
+        let scan_with = |known| {
+            let mut cfg: Config = toml::from_str(&text).unwrap();
+            let scan = add_roms(&mut cfg, known).unwrap();
+            let games = build(cfg, BTreeMap::new()).unwrap().games;
+            (scan.unidentified, games)
+        };
+
+        let (unidentified, g) = scan_with(Some(&known));
+        assert_eq!(unidentified, [new], "only the one never looked up is left to ask about");
+        let names: Vec<_> = g.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Homebrew", "New {x}", "Super Mario World {1}"], "braces in Hasheous's names are literal");
+        assert_eq!((g[2].igdb_id, g[2].art_id.map(|a| a.to_string())), (Some(1070), Some("steamgriddb:36886".into())));
+
+        let (unidentified, g) = scan_with(None);
+        assert!(unidentified.is_empty(), "nothing is asked with Hasheous off");
+        assert_eq!(g.iter().find(|g| g.name == "smw").map(|g| g.igdb_id), Some(None), "and its names aren't used");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn roms_files_pin_ids_and_hide_files() {
+        let dir = std::env::temp_dir().join(format!("rsgl-roms-files-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let [tgm2, neogeo, smw] = ["tgm2.zip", "neogeo.zip", "smw.zip"].map(|f| dir.join(f));
+        for f in [&tgm2, &neogeo, &smw] {
+            fs::write(f, "").unwrap();
+        }
+        let text = format!(
+            "[[roms]]\npath = {:?}\nextensions = [\"zip\"]\nexec = \"x\"\n\
+             files.\"tgm2.zip\" = {{ igdb_id = 1, steamgriddb_id = 2, grid_id = 3, hero_id = 4 }}\n\
+             files.\"neogeo.zip\" = {{ hidden = true }}\n\
+             files.\"smw.zip\" = {{ igdb_id = 5 }}\n\
+             files.\"gone.zip\" = {{ igdb_id = 6 }}\n",
+            dir.to_str().unwrap()
+        );
+        let found = api_hasheous::Found { name: "Super Mario World".into(), igdb_id: Some(1070), steamgriddb_id: Some(36886) };
+        let known = api_hasheous::Known::of(&[(&smw, Some(found))]);
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        let scan = add_roms(&mut cfg, Some(&known)).unwrap();
+        assert_eq!(scan.unidentified, [tgm2], "a hidden file isn't sent to Hasheous");
+        assert!(
+            matches!(&scan.warnings[..], [w] if w.contains("files") && w.contains("\"gone.zip\"")),
+            "a key that matches no file is a warning: {:?}",
+            scan.warnings
+        );
+        let g = build(cfg, BTreeMap::new()).unwrap().games;
+        let names: Vec<_> = g.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Super Mario World", "tgm2"], "neogeo is hidden");
+        let ids = |g: &Game| (g.igdb_id, g.art_id.map(|a| a.to_string()), g.grid_id, g.hero_id);
+        assert_eq!(ids(&g[1]), (Some(1), Some("steamgriddb:2".into()), Some(3), Some(4)));
+        assert_eq!(ids(&g[0]), (Some(5), Some("steamgriddb:36886".into()), None, None), "a pin beats Hasheous's id, key by key");
+
+        let r = checked(&text);
+        assert_eq!((r.games, r.hidden), (3, 1));
+        assert!(r.warnings.iter().any(|w| w.contains("\"gone.zip\"")), "{:?}", r.warnings);
+        let bad = text.replace("hidden = true", "hiden = true");
+        assert!(toml::from_str::<Config>(&bad).is_err(), "typos in a file's keys are caught");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn igdb_platform_narrows_the_search_and_changing_it_looks_roms_up_again() {
+        let dir = std::env::temp_dir().join(format!("rsgl-roms-platform-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for f in ["1080 Snowboarding (USA).z64", "pinned.z64"] {
+            fs::write(dir.join(f), "").unwrap();
+        }
+        let games_with = |keys: &str, cached: Option<&str>| {
+            let text = format!(
+                "[[roms]]\npath = {:?}\nextensions = [\"z64\"]\nexec = \"x\"\nfiles.\"pinned.z64\" = {{ igdb_id = 7 }}\n{keys}",
+                dir.to_str().unwrap()
+            );
+            let mut cfg: Config = toml::from_str(&text).map_err(|e| e.to_string())?;
+            add_roms(&mut cfg, None)?;
+            let found = |igdb_id| Meta { name: Some("1080° Snowboarding".into()), igdb_id, igdb_platform: cached.map(str::to_string), ..Meta::default() };
+            let meta = BTreeMap::from([("1080 Snowboarding".to_string(), found(None)), ("pinned".to_string(), found(Some(7)))]);
+            build(cfg, meta).map(|s| s.games)
+        };
+
+        let g = games_with("igdb_platform = \"n64\"", Some("n64")).unwrap();
+        assert_eq!(g[0].igdb_platform.as_deref(), Some("n64"));
+        assert!(g[0].meta.is_some(), "found on the same platform");
+        assert_eq!(g[1].igdb_platform, None, "a pinned igdb_id skips the search, so the platform doesn't apply");
+        assert!(g[1].meta.is_none(), "and data cached with one is stale");
+
+        let g = games_with("igdb_platform = \"n64\"", None).unwrap();
+        assert!(g[0].meta.is_none(), "found on any platform, before igdb_platform was set");
+        assert!(g[1].meta.is_some(), "a pinned game's data still holds");
+        assert!(games_with("igdb_platform = \"snes\"", Some("n64")).unwrap()[0].meta.is_none(), "found on another platform");
+        assert!(games_with("", Some("n64")).unwrap()[0].meta.is_none(), "igdb_platform was taken out");
+
+        let e = games_with("igdb_platform = \" \"", None).err().unwrap();
+        assert!(e.contains("igdb_platform is empty"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_roms_name_sets_the_title_with_igdb_name_and_year() {
+        let dir = std::env::temp_dir().join(format!("rsgl-roms-name-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for f in ["tgm2.zip", "1080 Snowboarding (USA).z64"] {
+            fs::write(dir.join(f), "").unwrap();
+        }
+        let text = |name: &str| {
+            format!("[[roms]]\npath = {:?}\nextensions = [\"zip\", \"z64\"]\nexec = \"x\"\n{name}", dir.to_str().unwrap())
+        };
+        let found = |name: &str| Meta { name: Some(name.into()), year: Some(2000), ..Meta::default() };
+        let meta = BTreeMap::from([
+            ("tgm2".to_string(), found("Tetris: The Grand Master 2 {x}")),
+            ("1080 Snowboarding".to_string(), Meta { year: Some(1998), ..Meta::default() }),
+        ]);
+        let games_with = |name: &str, meta: &BTreeMap<String, Meta>| {
+            let mut cfg: Config = toml::from_str(&text(name)).unwrap();
+            add_roms(&mut cfg, None).unwrap();
+            build(cfg, meta.clone()).unwrap().games
+        };
+
+        let g = games_with("name = \"{igdb_name} ({year})\"", &meta);
+        let names: Vec<_> = g.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["1080 Snowboarding", "tgm2"], "who a ROM is stays its file's name");
+        assert_eq!(g[1].title, "Tetris: The Grand Master 2 {x} (2000)", "braces in IGDB's names are literal");
+        assert_eq!(g[1].art_search(), Some("Tetris: The Grand Master 2 {x}"));
+        assert!(g[0].meta.is_none(), "cached before IGDB's names were kept, so it's looked up again");
+        assert_eq!(g[0].title, "1080 Snowboarding", "{{igdb_name}} is the file's name until IGDB has one");
+        assert!(g[0].needs_meta(false));
+
+        let mut snowboarding = games_with("name = \"{igdb_name} (N64)\"", &BTreeMap::new()).remove(0);
+        assert_eq!(snowboarding.title, "1080 Snowboarding (N64)");
+        snowboarding.set_meta(found("1080° Snowboarding"));
+        assert_eq!(snowboarding.title, "1080° Snowboarding (N64)");
+        assert_eq!(snowboarding.name, "1080 Snowboarding");
+        assert_eq!(snowboarding.art_search(), Some("1080° Snowboarding"));
+        snowboarding.set_meta(found("1080 SNOWBOARDING"));
+        assert_eq!(snowboarding.art_search(), None, "the same name needs no other search");
+
+        let g = games_with("", &meta);
+        assert_eq!(g[1].title, "tgm2", "without a name, the title is the file's");
+        assert_eq!(g[1].art_search(), Some("Tetris: The Grand Master 2 {x}"), "art still comes by IGDB's name");
+        assert!(!g[1].needs_meta(false));
+
+        let mut cfg: Config = toml::from_str(&text("name = \"{nope}\"")).unwrap();
+        add_roms(&mut cfg, None).unwrap();
+        let e = build(cfg, BTreeMap::new()).err().unwrap();
+        assert!(e.contains("name") && e.contains("nope"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_games_name_cant_use_igdb_name_and_isnt_searched_by_it() {
+        let e = game_err("[[game]]\nname = \"{igdb_name}\"\nexec = \"a\"\n");
+        assert!(e.contains("{igdb_name} only works in a [[roms]] name"), "{e}");
+        let text = "[[game]]\nname = \"Quake {year}\"\nexec = \"a\"\n";
+        let meta = Meta { name: Some("Quake (1996)".into()), year: Some(1996), ..Meta::default() };
+        let g = build(toml::from_str(text).unwrap(), BTreeMap::from([("Quake".to_string(), meta)])).unwrap().games;
+        assert_eq!(g[0].title, "Quake 1996");
+        assert_eq!(g[0].art_search(), None, "a [[game]] is searched for by the name written");
+    }
+
+    #[test]
+    fn a_missing_rom_folder_is_a_warning_and_bad_roms_tables_are_errors() {
+        let roms = |extra: &str| format!("[[roms]]\npath = \"/definitely/not/here\"\nexec = \"x\"\n{extra}");
+        assert!(games(&roms("extensions = [\"sfc\"]")).unwrap().is_empty());
+        let r = checked(&roms("extensions = [\"sfc\"]"));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(r.warnings[0].contains("/definitely/not/here"), "{:?}", r.warnings);
+
+        assert!(game_err(&roms("extensions = []")).contains("extensions is empty"));
+        assert!(toml::from_str::<Config>(&roms("extensions = [\"sfc\"]\nextension = 1")).is_err(), "typos are caught");
+        let r = checked("[[roms]]\npath = \"{nope}\"\nextensions = [\"sfc\"]\nexec = \"x\"\n");
+        assert!(r.errors[0].contains("[[roms]]") && r.errors[0].contains("{nope}"), "{:?}", r.errors);
     }
 }

@@ -108,12 +108,15 @@ impl Bindable for Button {
             Action::Down => &["DPadDown", "LeftStickDown"],
             Action::Left => &["DPadLeft", "LeftStickLeft"],
             Action::Right => &["DPadRight", "LeftStickRight"],
-            Action::PageUp => &["LB"],
-            Action::PageDown => &["RB"],
+            Action::PageUp => &["LT"],
+            Action::PageDown => &["RT"],
             Action::Launch => &["A"],
             Action::Menu => &["Menu"],
             Action::Back => &["B"],
             Action::Reload => &["View"],
+            // the bumpers switch tabs on a console
+            Action::PrevFilter => &["LB"],
+            Action::NextFilter => &["RB"],
         }
     }
 
@@ -399,6 +402,8 @@ mod tests {
         assert_eq!(p.map.action(Button::A), Some(Action::Launch));
         assert_eq!(p.map.action(Button::LeftStickLeft), Some(Action::Left));
         assert_eq!(p.map.action(Button::Guide), None);
+        assert_eq!(p.map.action(Button::RB), Some(Action::NextFilter), "the bumpers switch the filter");
+        assert_eq!(p.map.action(Button::LT), Some(Action::PageUp), "and the triggers page");
 
         let cfg: BTreeMap<String, Vec<String>> = toml::from_str("back = [\"A\"]").unwrap();
         let e = Padmap::try_from(cfg).unwrap_err();

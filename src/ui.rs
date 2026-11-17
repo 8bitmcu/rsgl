@@ -1,11 +1,13 @@
 use crate::{
-    api_igdb, api_steamgriddb,
+    api_hasheous, api_igdb, api_steamgriddb,
     config::{self, Game, MenuAction, MenuEntry, Settings},
     gamepad::Pad,
     keys::{Action, Keymap, Press},
-    launch, playtime, spawn,
+    launch, playtime,
+    search::{genres, Query},
+    spawn,
     status::{self, Part, Status},
-    topbar::{Complete, SortBy, Target, Topbar, Widget, WidgetId},
+    topbar::{Complete, Filter, SortBy, Target, Topbar, Widget, WidgetId},
     Launched,
 };
 use eframe::egui;
@@ -45,6 +47,8 @@ const TOOL_FONT: f32 = 15.0;
 const TOOL_PAD: f32 = 14.0;
 /// Room for a top bar menu's arrow, after its title.
 const ARROW_W: f32 = 16.0;
+/// Each side of a top bar filter, for its arrow: the part that's clicked to switch.
+const SELECTOR_SIDE: f32 = TOOL_PAD + ARROW_W;
 /// A top bar toggle's switch, after its title.
 const SWITCH: egui::Vec2 = vec2(30.0, 16.0);
 /// Between a toggle's title and its switch.
@@ -61,9 +65,11 @@ pub fn run(
     fullscreen: bool,
     search: String,
 ) -> eframe::Result<Option<Launched>> {
-    let Settings { games, ui: cfg, api, playtime: pt_cfg, keyboard, gamepad, status, topbar, library } = settings;
+    let Settings { games, ui: cfg, api, playtime: pt_cfg, keyboard, gamepad, status, topbar, library, unidentified_roms } =
+        settings;
     let key = api.steamgriddb_key();
     let igdb = api.igdb_credentials();
+    let hasheous = api.hasheous_api();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
@@ -87,6 +93,7 @@ pub fn run(
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let rx = fetch(&cc.egui_ctx, &games, key, cfg.blur);
             let meta = fetch_meta(&cc.egui_ctx, &games, status.uses_igdb || topbar.uses_igdb, igdb);
+            let roms = identify(&cc.egui_ctx, hasheous, unidentified_roms);
             Ok(Box::new(App {
                 games,
                 error,
@@ -95,11 +102,15 @@ pub fn run(
                 selected: 0,
                 selected_game: None,
                 prev_sort: topbar.sort(),
+                prev_filter: topbar.filter().map(|f| f.title.clone()),
                 page_rows: 1,
                 card_w: cfg.card_width.clamp(80.0, 400.0),
                 controls: Controls { keys: keyboard, pad: Pad::start(&cc.egui_ctx, gamepad) },
                 rx,
                 meta,
+                roms,
+                roms_identified: false,
+                art_renamed: false,
                 status,
                 topbar,
                 library,
@@ -133,6 +144,7 @@ fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) ->
             art_id: g.art_id,
             grid_id: g.grid_id,
             hero_id: g.hero_id,
+            search: g.art_search().map(str::to_string),
         })
         .collect();
     let ctx = ctx.clone();
@@ -156,10 +168,21 @@ fn fetch_meta(
             Some(_) => g.meta.is_none(),
             None => g.needs_meta(bars_use_igdb),
         })
-        .map(|(i, g)| (i, g.name.clone(), g.igdb_id))
+        .map(|(index, g)| api_igdb::Job {
+            index,
+            name: g.name.clone(),
+            igdb_id: g.igdb_id,
+            platform: g.igdb_platform.clone(),
+        })
         .collect();
     let ctx = ctx.clone();
     api_igdb::spawn_meta_fetcher(jobs, credentials, move || ctx.request_repaint())
+}
+
+/// Starts asking the Hasheous at `api` what `files` are, see `App::roms`.
+fn identify(ctx: &egui::Context, api: String, files: Vec<PathBuf>) -> mpsc::Receiver<bool> {
+    let ctx = ctx.clone();
+    api_hasheous::spawn_identifier(api, files, move || ctx.request_repaint())
 }
 
 /// How a status part or top bar label is drawn.
@@ -189,6 +212,7 @@ enum Item<'a> {
     Search(Option<&'a str>),
     /// A button, menu, toggle or sort.
     Tool(WidgetId, &'a str, Kind),
+    Filter(WidgetId, &'a Filter),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -230,13 +254,8 @@ fn tool_button(ui: &mut egui::Ui, title: &str, kind: Kind, focused: bool) -> egu
     let size = vec2(galley.size().x + 2.0 * TOOL_PAD + extra, bar_height(ui));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let radius = egui::CornerRadius::same(10);
+        let color = tool_box(ui, &resp, focused);
         let painter = ui.painter();
-        painter.rect_filled(rect, radius, if resp.hovered() { TOOL_HOVER } else { SURFACE });
-        if focused {
-            painter.rect_stroke(rect, radius, Stroke::new(OUTLINE, ACCENT), egui::StrokeKind::Inside);
-        }
-        let color = if focused || resp.hovered() { Color32::WHITE } else { Color32::from_gray(210) };
         match kind {
             Kind::Button => {}
             Kind::Menu => {
@@ -263,6 +282,72 @@ fn tool_button(ui: &mut egui::Ui, title: &str, kind: Kind, focused: bool) -> egu
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// The box under a top bar tool, outlined while it has the focus. Returns the color
+/// for what's drawn on it.
+fn tool_box(ui: &egui::Ui, resp: &egui::Response, focused: bool) -> Color32 {
+    let radius = egui::CornerRadius::same(10);
+    let painter = ui.painter();
+    painter.rect_filled(resp.rect, radius, if resp.hovered() { TOOL_HOVER } else { SURFACE });
+    if focused {
+        painter.rect_stroke(resp.rect, radius, Stroke::new(OUTLINE, ACCENT), egui::StrokeKind::Inside);
+    }
+    if focused || resp.hovered() { Color32::WHITE } else { Color32::from_gray(210) }
+}
+
+/// How wide the widest of a filter's titles is, so the arrows stay put as it switches.
+fn widest_title(ui: &egui::Ui, filter: &Filter) -> f32 {
+    let width = |title: &str| {
+        let text = egui::WidgetText::from(tool_text(title));
+        text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x
+    };
+    filter.options.iter().map(|o| width(&o.title)).fold(0.0, f32::max)
+}
+
+/// A top bar filter: `< title >`, on a box like a button's. Its arrows switch it and its
+/// title opens a dropdown, see `selector_side`. When the zone is short of room the
+/// title is cut off.
+fn selector(ui: &mut egui::Ui, filter: &Filter, focused: bool) -> egui::Response {
+    let text_w = widest_title(ui, filter).min((ui.available_width() - 2.0 * SELECTOR_SIDE).max(0.0));
+    let title = &filter.options[filter.current].title;
+    let galley = egui::WidgetText::from(tool_text(title)).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        text_w,
+        egui::TextStyle::Body,
+    );
+    let (rect, resp) = ui.allocate_exact_size(vec2(text_w + 2.0 * SELECTOR_SIDE, bar_height(ui)), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = tool_box(ui, &resp, focused);
+        let painter = ui.painter();
+        let hover = resp.hover_pos().map_or(0, |p| selector_side(rect, p));
+        for side in [-1, 1] {
+            let x = rect.center().x + side as f32 * (rect.width() / 2.0 - TOOL_PAD - ARROW_W / 2.0);
+            let c = egui::pos2(x, rect.center().y);
+            let s = side as f32;
+            let mut points = vec![c + vec2(-2.5 * s, -4.5), c + vec2(3.0 * s, 0.0), c + vec2(-2.5 * s, 4.5)];
+            if side < 0 {
+                points.reverse(); // clockwise, like the menu's arrow
+            }
+            let color = if hover == side { ACCENT } else { color };
+            painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+        }
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Which part of a filter `rect` that `pos` is on: -1 for the left arrow, 1 for the
+/// right one, 0 for the title.
+fn selector_side(rect: egui::Rect, pos: egui::Pos2) -> isize {
+    if pos.x < rect.left() + SELECTOR_SIDE {
+        -1
+    } else if pos.x > rect.right() - SELECTOR_SIDE {
+        1
+    } else {
+        0
+    }
+}
+
 impl Item<'_> {
     /// How wide it wants to be, before it's squeezed.
     fn width(&self, ui: &egui::Ui) -> f32 {
@@ -286,6 +371,7 @@ impl Item<'_> {
                 );
                 galley.size().x + 2.0 * TOOL_PAD + kind.extra()
             }
+            Item::Filter(_, filter) => widest_title(ui, filter) + 2.0 * SELECTOR_SIDE,
         }
     }
 }
@@ -303,15 +389,26 @@ fn items<'a>(zone: usize, widgets: &'a [Widget], vars: &config::Vars, env: &dyn 
             Widget::Toggle(t) => Some(Item::Tool((zone, i), &t.title, Kind::Toggle(t.on))),
             // the order it's on: the bar is short of room, and the arrow says it's a dropdown
             Widget::Sort(sort) => Some(Item::Tool((zone, i), sort.options[sort.current].label(), Kind::Menu)),
+            Widget::Filter(filter) => Some(Item::Filter((zone, i), filter)),
         })
         .collect()
 }
 
 /// What the top bar drew that can be used: the search box, and the buttons, menus,
-/// toggles and sort that aren't cut off.
+/// toggles, sort and filter that aren't cut off.
 struct Drawn {
     search: Option<egui::Response>,
     tools: Vec<(WidgetId, egui::Response)>,
+}
+
+impl Drawn {
+    /// Adds tool `id`, drawn in `zone`, unless it's cut off: one past the edge of a short
+    /// zone can't be seen, so it can't have the focus either.
+    fn tool(&mut self, zone: &egui::Ui, id: WidgetId, resp: egui::Response) {
+        if zone.clip_rect().expand(0.5).contains_rect(resp.rect) {
+            self.tools.push((id, resp));
+        }
+    }
 }
 
 /// The search box, as tall as the top bar.
@@ -368,10 +465,11 @@ fn draw_topbar(
                 }
                 Item::Tool(id, title, kind) => {
                     let resp = tool_button(&mut zone, title, kind, focus == Some(id));
-                    // one past the edge of a short zone can't be seen, so it can't have the focus either
-                    if zone.clip_rect().expand(0.5).contains_rect(resp.rect) {
-                        drawn.tools.push((id, resp));
-                    }
+                    drawn.tool(&zone, id, resp);
+                }
+                Item::Filter(id, filter) => {
+                    let resp = selector(&mut zone, filter, focus == Some(id));
+                    drawn.tool(&zone, id, resp);
                 }
                 Item::Search(placeholder) => {
                     // It always has the keyboard focus, so egui's focus outline would say
@@ -525,11 +623,15 @@ struct App {
     selected: usize, // position within the filtered list
     selected_game: Option<usize>, // the game at `selected` last frame, so it stays selected when the order changes under it
     prev_sort: SortBy,
+    prev_filter: Option<String>, // the filter's title last frame, to start a new one from its first game
     page_rows: usize, // rows that fit in the grid, for PageUp/PageDown
     card_w: f32,
     controls: Controls,
     rx: mpsc::Receiver<api_steamgriddb::Update>,
     meta: mpsc::Receiver<(usize, api_igdb::Meta)>, // IGDB metadata, by game index
+    roms: mpsc::Receiver<bool>, // whether each ROM Hasheous was asked about was identified; closed when it's done
+    roms_identified: bool, // some were, so the games are loaded again once it's done, to get their names
+    art_renamed: bool,     // IGDB named a ROM, so the games are loaded again once it's done, see `Game::art_search`
     status: Status,
     topbar: Topbar,
     library: config::Library, // to build the games and top bar again when a toggle switches a variable
@@ -581,15 +683,17 @@ enum Source {
     Topbar(WidgetId),
     /// The top bar's sort: its options.
     Sort(WidgetId),
+    /// The top bar's filter: its titles.
+    Filter(WidgetId),
 }
 
 impl Source {
-    /// The tools it runs. A sort has none.
+    /// The tools it runs. A sort or filter has none.
     fn entries<'a>(self, games: &'a [Game], topbar: &'a Topbar) -> &'a [MenuEntry] {
         match self {
             Source::Game(i) => &games[i].menu,
             Source::Topbar(id) => topbar.widget(id).tools(),
-            Source::Sort(_) => &[],
+            Source::Sort(_) | Source::Filter(_) => &[],
         }
     }
 
@@ -599,68 +703,27 @@ impl Source {
             let Widget::Sort(sort) = topbar.widget(id) else { unreachable!("a sort's menu is from a sort") };
             return sort.options.iter().map(|o| (o.label(), true)).collect();
         }
+        if let Source::Filter(id) = self {
+            let Widget::Filter(filter) = topbar.widget(id) else { unreachable!("a filter's menu is from a filter") };
+            return filter.options.iter().map(|o| (o.title.as_str(), true)).collect();
+        }
         let entries = self.entries(games, topbar).iter();
         // "open folder" with no workdir to open does nothing
         entries.map(|e| (e.title.as_str(), e.action != MenuAction::OpenFolder || e.workdir.is_some())).collect()
     }
 }
 
-/// A search, lowercased: the name text plus its `t:` tag and `g:` genre filters.
-/// "t:coop g:shoot quake" is the name "quake", tag "coop" and genre "shoot".
-#[derive(Debug, Default, PartialEq)]
-struct Query {
-    name: String,
-    tags: Vec<String>,
-    genres: Vec<String>,
-}
-
-impl Query {
-    fn parse(query: &str) -> Query {
-        let mut q = Query::default();
-        let mut name = Vec::new();
-        for word in query.to_lowercase().split_whitespace() {
-            let (list, filter) = match (word.strip_prefix("t:"), word.strip_prefix("g:")) {
-                (Some(tag), _) => (&mut q.tags, tag),
-                (_, Some(genre)) => (&mut q.genres, genre),
-                _ => (&mut name, word),
-            };
-            if !filter.is_empty() {
-                // a bare `t:` or `g:` is still being typed, don't filter yet
-                list.push(filter.to_string());
-            }
-        }
-        q.name = name.join(" ");
-        q
-    }
-
-    fn matches_game(&self, g: &Game) -> bool {
-        self.matches(&g.title, &g.tags, genres(g))
-    }
-
-    /// Tags match from their start, genres anywhere in them, since IGDB's have
-    /// spaces ("Real Time Strategy (RTS)") and the search splits on whitespace.
-    fn matches(&self, title: &str, tags: &[String], genres: &[String]) -> bool {
-        title.to_lowercase().contains(&self.name)
-            && self.tags.iter().all(|t| tags.iter().any(|tag| tag.to_lowercase().starts_with(t)))
-            && self.genres.iter().all(|g| genres.iter().any(|genre| genre.to_lowercase().contains(g)))
-    }
-}
-
-/// IGDB's genres for `g`, none until they're known.
-fn genres(g: &Game) -> &[String] {
-    g.meta.as_ref().map_or(&[], |m| &m.genres)
-}
-
 /// What autocomplete adds to the end of `query`: the rest of the name, `t:` tag or
 /// `g:` genre word being typed, the first in alphabetical order that's longer. Only
-/// from the games the rest of the search shows, so taking it never empties the grid.
-fn suggestion(query: &str, games: &[Game], complete: &[Complete]) -> Option<String> {
+/// from the games the rest of the search and the top bar's `filter` show, so taking
+/// it never empties the grid.
+fn suggestion(query: &str, games: &[Game], complete: &[Complete], filter: Option<&Query>) -> Option<String> {
     if complete.is_empty() || query.ends_with(char::is_whitespace) {
         return None;
     }
     let word = query.split_whitespace().next_back()?;
     let rest = Query::parse(&query[..query.len() - word.len()]);
-    let shown = games.iter().filter(|g| rest.matches_game(g));
+    let shown = games.iter().filter(|g| filter.is_none_or(|f| f.matches_game(g)) && rest.matches_game(g));
     let word = word.to_lowercase();
     let (typed, candidates): (String, Vec<&str>) = match (word.strip_prefix("t:"), word.strip_prefix("g:")) {
         (Some(tag), _) if complete.contains(&Complete::Tags) => {
@@ -692,11 +755,13 @@ fn after_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 impl App {
-    /// Indices of the games matching the search, in the top bar's sort order.
+    /// Indices of the games matching the search and the top bar's filter, in the top
+    /// bar's sort order.
     fn filtered(&self) -> Vec<usize> {
         let query = Query::parse(&self.query);
+        let filter = self.topbar.filter().map(|f| &f.query);
         let mut shown: Vec<usize> = (0..self.games.len())
-            .filter(|&i| query.matches_game(&self.games[i]))
+            .filter(|&i| filter.is_none_or(|f| f.matches_game(&self.games[i])) && query.matches_game(&self.games[i]))
             .collect();
         sort(&mut shown, &self.games, self.playtime.as_ref(), self.topbar.sort());
         shown
@@ -725,7 +790,7 @@ impl App {
     /// On an error the current games are kept. Window and playtime settings
     /// still need a restart.
     fn reload(&mut self, ctx: &egui::Context) {
-        let Settings { mut games, ui, api, keyboard, gamepad, status, topbar, library, .. } = match config::load() {
+        let Settings { mut games, ui, api, keyboard, gamepad, status, mut topbar, library, unidentified_roms, .. } = match config::load() {
             Ok(s) => s,
             Err(e) => {
                 self.error = Some(e);
@@ -739,12 +804,18 @@ impl App {
         // replacing rx drops the old receiver, which stops the old fetcher
         self.rx = fetch(ctx, &games, api.steamgriddb_key(), ui.blur);
         self.meta = fetch_meta(ctx, &games, status.uses_igdb || topbar.uses_igdb, api.igdb_credentials());
+        self.roms = identify(ctx, api.hasheous_api(), unidentified_roms);
+        self.roms_identified = false;
+        self.art_renamed = false;
         self.games = games;
         self.status = status;
+        // the order and filter stay, so F5 (or Hasheous's names coming in) doesn't lose your place
+        topbar.keep_picks(&self.topbar);
         self.topbar = topbar;
         self.library = library;
-        // the reloaded sort may be another one, but the selection is found again by name
+        // either may still be another one, but the selection is found again by name
         self.prev_sort = self.topbar.sort();
+        self.prev_filter = self.topbar.filter().map(|f| f.title.clone());
         self.menu = None;
         self.focus = None; // the widget it was on may be gone
         self.bar.clear();
@@ -775,10 +846,11 @@ impl App {
         self.error = Some(msg);
     }
 
-    /// Uses entry `k` of `source`: picks a sort, or runs a tool, see `run_entry`.
+    /// Uses entry `k` of `source`: picks a sort or filter, or runs a tool, see `run_entry`.
     fn pick(&mut self, ctx: &egui::Context, source: Source, k: usize) {
         match source {
             Source::Sort(id) => self.topbar.set_sort(id, k),
+            Source::Filter(id) => self.topbar.set_filter(id, k),
             Source::Game(_) | Source::Topbar(_) => self.run_entry(ctx, source, k),
         }
     }
@@ -937,9 +1009,29 @@ impl eframe::App for App {
                 api_steamgriddb::Update::Background(i, path) => self.games[i].background = Some(path),
             }
         }
-        while let Ok((i, meta)) = self.meta.try_recv() {
-            self.games[i].set_meta(meta);
-        }
+        // a ROM that IGDB just named is searched for by that name, which the art fetcher
+        // only knows from a reload, so there's one once IGDB is through them all
+        let meta_done = loop {
+            match self.meta.try_recv() {
+                Ok((i, meta)) => {
+                    let g = &mut self.games[i];
+                    let search = g.art_search().map(str::to_string);
+                    g.set_meta(meta);
+                    self.art_renamed |= g.art_search() != search.as_deref();
+                }
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break std::mem::take(&mut self.art_renamed),
+            }
+        };
+        // a game's name is who it is (playtime, art), so Hasheous's names only come in
+        // with a reload, once it's through all the ROMs rather than for each one
+        let roms_done = loop {
+            match self.roms.try_recv() {
+                Ok(identified) => self.roms_identified |= identified,
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break std::mem::take(&mut self.roms_identified),
+            }
+        };
 
         let (now, focused) = ctx.input(|i| (i.time, i.focused));
         self.controls.pad.update(now, focused);
@@ -1015,14 +1107,22 @@ impl eframe::App for App {
             self.focus = None; // typing is for the grid
             moved = true;
         }
-        // a new order starts from its first game, like a new search
-        if self.topbar.sort() != self.prev_sort {
+        // the filter switches from the grid and the top bar alike
+        for (action, by) in [(Action::PrevFilter, -1), (Action::NextFilter, 1)] {
+            if self.controls.take(ctx, action) && !menu_open {
+                self.topbar.step_filter(by);
+            }
+        }
+        // a new order or filter starts from its first game, like a new search
+        let filter = self.topbar.filter().map(|f| &f.title);
+        if self.topbar.sort() != self.prev_sort || filter != self.prev_filter.as_ref() {
             self.prev_sort = self.topbar.sort();
+            self.prev_filter = filter.cloned();
             self.selected = 0;
             moved = true;
         }
 
-        if self.controls.take(ctx, Action::Reload) {
+        if self.controls.take(ctx, Action::Reload) | roms_done | meta_done {
             let current = self.filtered().get(self.selected).map(|&i| self.games[i].name.clone());
             self.reload(ctx);
             let shown = self.filtered();
@@ -1108,7 +1208,8 @@ impl eframe::App for App {
                 }
             }
             hint.push(')');
-            let ghost = suggestion(&self.query, &self.games, self.topbar.autocomplete());
+            let filter = self.topbar.filter().map(|f| &f.query);
+            let ghost = suggestion(&self.query, &self.games, self.topbar.autocomplete(), filter);
             let (query, focus) = (&mut self.query, self.focus);
             // no fill, the background shows through. No bottom margin, the grid's own spacing follows
             tools = egui::TopBottomPanel::top("topbar")
@@ -1176,7 +1277,11 @@ impl eframe::App for App {
                 if shown.is_empty() {
                     ui.add_space(80.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("No games match your search").size(18.0).color(gray));
+                        let msg = match self.topbar.filter() {
+                            Some(f) if self.query.is_empty() => format!("No games in {}", f.title),
+                            _ => "No games match your search".to_string(),
+                        };
+                        ui.label(RichText::new(msg).size(18.0).color(gray));
                     });
                 }
 
@@ -1262,9 +1367,11 @@ impl eframe::App for App {
         self.bar = tools.iter().map(|&(id, _)| id).collect();
         self.bar.sort(); // the right zone is drawn from the edge in, and ids sort left to right
 
-        // a top bar button runs its tool, a toggle flips, a menu or sort opens under itself
-        let clicked = tools.iter().find(|(_, r)| r.clicked() && !menu_open && !swallow).map(|&(id, _)| id);
-        if let Some(id) = clicked.or(use_widget) {
+        // a top bar button runs its tool, a toggle flips, a menu or sort opens under itself,
+        // a filter switches with a click on an arrow and opens with one on its title
+        let clicked = tools.iter().find(|(_, r)| r.clicked() && !menu_open && !swallow);
+        let side = clicked.and_then(|(_, r)| Some(selector_side(r.rect, r.interact_pointer_pos()?))).unwrap_or(0);
+        if let Some(id) = clicked.map(|&(id, _)| id).or(use_widget) {
             let dropdown = |source, selected| {
                 // a menu cut off by a narrow window still opens, at the top
                 let pos = tools
@@ -1288,7 +1395,9 @@ impl eframe::App for App {
                 Widget::Menu { .. } => self.menu = dropdown(Source::Topbar(id), 0),
                 // it opens on the order it has now
                 Widget::Sort(sort) => self.menu = dropdown(Source::Sort(id), sort.current),
-                Widget::Label(_) | Widget::Search { .. } => unreachable!("only buttons, menus, toggles and sorts are tools"),
+                Widget::Filter(filter) if side == 0 => self.menu = dropdown(Source::Filter(id), filter.current),
+                Widget::Filter(_) => self.topbar.step_filter(side),
+                Widget::Label(_) | Widget::Search { .. } => unreachable!("only buttons, menus, toggles, sorts and filters are tools"),
             }
             // drawn before this: a toggle and the labels using its variable, or a dropdown
             ctx.request_repaint();
@@ -1346,23 +1455,6 @@ mod tests {
     }
 
     #[test]
-    fn search_splits_into_name_tags_and_genres() {
-        let q = Query::parse("  T:Coop quake g:Shoot  arena t: g:");
-        let strings = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(q, Query { name: "quake arena".into(), tags: strings(&["coop"]), genres: strings(&["shoot"]) });
-    }
-
-    #[test]
-    fn genres_match_anywhere_in_a_genre() {
-        let genres = ["Real Time Strategy (RTS)".to_string(), "Simulator".to_string()];
-        let m = |q: &str| Query::parse(q).matches("Command & Conquer 3", &[], &genres);
-        assert!(m("g:Strategy") && m("g:rts") && m("g:sim") && m("g:strat g:sim"));
-        assert!(m("g:") && m("command g:rts"), "a bare g: doesn't filter");
-        assert!(!m("g:shooter") && !m("g:rts g:shooter") && !m("quake g:rts"));
-        assert!(!Query::parse("g:rts").matches("Quake", &[], &[]), "no genres known yet");
-    }
-
-    #[test]
     fn autocomplete_suggests_from_the_games_the_rest_of_the_search_shows() {
         let cfg = "[[game]]\nname = \"Quake III Arena\"\nexec = \"a\"\ntags = [\"fps\", \"lan\"]\n\
                    [[game]]\nname = \"Quake\"\nexec = \"b\"\ntags = [\"fps\", \"coop\"]\n\
@@ -1372,7 +1464,7 @@ mod tests {
         let cnc = games.iter_mut().find(|g| g.name.starts_with("Command")).unwrap();
         cnc.set_meta(api_igdb::Meta { genres: genres.into(), ..Default::default() });
         let all = [Complete::Names, Complete::Tags, Complete::Genres];
-        let s = |q: &str| suggestion(q, &games, &all);
+        let s = |q: &str| suggestion(q, &games, &all, None);
 
         assert_eq!(s("qu").as_deref(), Some("ake"), "the first in alphabetical order");
         assert_eq!(s("QUAKE").as_deref(), Some(" III Arena"), "longer than what's typed, any case");
@@ -1388,9 +1480,13 @@ mod tests {
         assert_eq!(s("").as_deref(), None);
         assert_eq!(s("zork").as_deref(), None);
 
-        assert_eq!(suggestion("qu", &games, &[Complete::Tags]), None, "names are off");
-        assert_eq!(suggestion("t:co", &games, &[Complete::Names]), None, "tags are off, and t:co isn't a name");
-        assert_eq!(suggestion("qu", &games, &[]), None);
+        assert_eq!(suggestion("qu", &games, &[Complete::Tags], None), None, "names are off");
+        assert_eq!(suggestion("t:co", &games, &[Complete::Names], None), None, "tags are off, and t:co isn't a name");
+        assert_eq!(suggestion("qu", &games, &[], None), None);
+
+        let lan = Query::parse("t:lan");
+        assert_eq!(suggestion("qu", &games, &all, Some(&lan)).as_deref(), Some("ake III Arena"), "only the filter's games");
+        assert_eq!(suggestion("t:", &games, &all, Some(&lan)).as_deref(), Some("fps"));
     }
 
     #[test]

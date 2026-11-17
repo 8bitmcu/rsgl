@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    path::Path,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 #[cfg(unix)]
@@ -23,7 +24,11 @@ pub struct Entry {
 pub type Playtime = BTreeMap<String, Entry>;
 
 pub fn load() -> Playtime {
-    fs::read_to_string(config::playtime_file())
+    read(&config::playtime_file())
+}
+
+fn read(path: &Path) -> Playtime {
+    fs::read_to_string(path)
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
@@ -33,14 +38,14 @@ pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// Adds `played` to the game's total. Locked, so several trackers don't overwrite each other.
-fn add(name: &str, played: Duration) -> Result<(), String> {
-    let path = config::playtime_file();
+/// Adds `played` to the game's total in `path`. Locked, so several trackers don't
+/// overwrite each other.
+fn add(path: &Path, name: &str, played: Duration) -> Result<(), String> {
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let _guard = lock(&dir.join("playtime.lock"), true);
 
-    let mut all = load();
+    let mut all = read(path);
     let e = all.entry(name.to_string()).or_default();
     e.seconds += played.as_secs();
     e.last_played = now();
@@ -48,7 +53,7 @@ fn add(name: &str, played: Duration) -> Result<(), String> {
     let text = toml::to_string(&all).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("part");
     fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
+    fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// True while any process in the group is alive. Reaps our own exited children
@@ -105,8 +110,8 @@ pub fn wait(pgid: u32) {
 }
 
 /// Waits until the game has finished (on Unix, until its process group is empty),
-/// saving the time played every `checkpoint` (if non-zero) and once more at the end.
-pub fn track(pgid: u32, name: &str, checkpoint: Duration) {
+/// saving the time played to `file` every `checkpoint` (if non-zero) and once more at the end.
+pub fn track(pgid: u32, file: &Path, name: &str, checkpoint: Duration) {
     // Instant doesn't advance while the machine is suspended, so sleep isn't counted
     let mut last = Instant::now();
     loop {
@@ -115,7 +120,7 @@ pub fn track(pgid: u32, name: &str, checkpoint: Duration) {
         if !alive || (!checkpoint.is_zero() && now - last >= checkpoint) {
             // only move `last` forward by whole seconds, so no time is lost to rounding
             let played = Duration::from_secs((now - last).as_secs());
-            if let Err(e) = add(name, played) {
+            if let Err(e) = add(file, name, played) {
                 eprintln!("rsgl: saving playtime: {e}");
             }
             last += played;

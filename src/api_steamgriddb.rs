@@ -180,16 +180,28 @@ pub struct Job {
     pub grid_id: Option<u64>,
     /// Configured hero to use for the background.
     pub hero_id: Option<u64>,
+    /// What to search for instead of `name`, see `config::Game::art_search`.
+    pub search: Option<String>,
 }
 
 impl Job {
-    /// What the configured ids say the cover should come from, if they say anything.
+    /// What the configured ids (or failing those, `search`) say the cover should come
+    /// from, if they say anything.
     fn cover_source(&self) -> Option<String> {
-        self.grid_id.map(|id| format!("grid:{id}")).or(self.art_id.map(|a| a.to_string()))
+        self.grid_id.map(|id| format!("grid:{id}")).or_else(|| self.game_source())
     }
 
     fn hero_source(&self) -> Option<String> {
-        self.hero_id.map(|id| format!("hero:{id}")).or(self.art_id.map(|a| a.to_string()))
+        self.hero_id.map(|id| format!("hero:{id}")).or_else(|| self.game_source())
+    }
+
+    fn game_source(&self) -> Option<String> {
+        self.art_id.map(|a| a.to_string()).or_else(|| self.search.as_ref().map(|s| format!("search:{s}")))
+    }
+
+    /// What SteamGridDB is searched for without an `art_id`.
+    fn search_name(&self) -> &str {
+        self.search.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -218,16 +230,16 @@ fn mark(marker: &Path, source: Option<&str>) {
 fn lookup(client: &Client, j: &Job) -> Option<u64> {
     let found = match j.art_id {
         Some(art) => client.resolve(art),
-        None => client.search(&j.name),
+        None => client.search(j.search_name()),
     };
     match found {
         Ok(Some(id)) => Some(id),
         Ok(None) => {
-            eprintln!("no SteamGridDB match for {:?}", j.name);
+            eprintln!("no SteamGridDB match for {:?}", j.search_name());
             None
         }
         Err(e) => {
-            eprintln!("SteamGridDB lookup failed for {:?}: {e}", j.name);
+            eprintln!("SteamGridDB lookup failed for {:?}: {e}", j.search_name());
             None
         }
     }
@@ -363,7 +375,7 @@ mod tests {
     use super::*;
 
     fn job(art_id: Option<config::ArtId>, grid_id: Option<u64>, hero_id: Option<u64>) -> Job {
-        Job { index: 0, name: "A".into(), cover: None, art_id, grid_id, hero_id }
+        Job { index: 0, name: "A".into(), cover: None, art_id, grid_id, hero_id, search: None }
     }
 
     #[test]
@@ -376,6 +388,18 @@ mod tests {
         let j = job(None, None, Some(15208));
         assert_eq!(j.cover_source(), None, "nothing configured for the cover");
         assert_eq!(j.hero_source().as_deref(), Some("hero:15208"));
+    }
+
+    #[test]
+    fn a_rom_searched_by_its_igdb_name_fetches_its_art_again() {
+        let search = |art_id| Job { search: Some("1080° Snowboarding".into()), ..job(art_id, None, None) };
+        let j = search(None);
+        assert_eq!(j.search_name(), "1080° Snowboarding");
+        assert_eq!(j.cover_source().as_deref(), Some("search:1080° Snowboarding"), "art from the file name's search is stale");
+        assert_eq!(j.hero_source(), j.cover_source());
+        let j = search(Some(config::ArtId::SteamGridDb(1)));
+        assert_eq!(j.cover_source().as_deref(), Some("steamgriddb:1"), "an id wins over any search");
+        assert_eq!(job(None, None, None).search_name(), "A");
     }
 
     #[test]

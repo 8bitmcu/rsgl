@@ -1,6 +1,7 @@
 // Release builds on Windows are GUI programs, so no console window opens next to the launcher.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod api_hasheous;
 mod api_igdb;
 mod api_steamgriddb;
 mod blur;
@@ -8,6 +9,7 @@ mod config;
 mod gamepad;
 mod keys;
 mod playtime;
+mod search;
 mod status;
 mod topbar;
 mod ui;
@@ -125,6 +127,7 @@ Options:
   -c, --config <FILE>  Read this config file instead of the default locations
   -f, --fullscreen     Start fullscreen
   -s, --search <TEXT>  Start with TEXT in the search bar (t:tag, g:genre filter)
+      --filter <NAME>  Start on the top bar's filter with this title
   -h, --help           Show this help
 
 Commands that run without opening the window (use one):
@@ -133,6 +136,7 @@ Commands that run without opening the window (use one):
       --show <GAME>    Print how GAME will run (exec, workdir, env, menu)
       --check          Check the whole config, hidden games included
       --igdb <NAME>    Search IGDB for NAME and print the JSON it returns
+      --igdb-matches   Print which IGDB game each game's year and genres come from
 ";
 
 /// A command that runs without opening the window.
@@ -143,23 +147,25 @@ enum Action {
     Show(String),
     Check,
     Igdb(String),
+    IgdbMatches,
 }
 
 struct Cli {
     fullscreen: bool,
     config: Option<PathBuf>,
     search: String,
+    filter: Option<String>,
     action: Option<Action>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
-    let mut cli = Cli { fullscreen: false, config: None, search: String::new(), action: None };
+    let mut cli = Cli { fullscreen: false, config: None, search: String::new(), filter: None, action: None };
     let set_action = |cli: &mut Cli, action: Action| match cli.action {
         None => {
             cli.action = Some(action);
             Ok(())
         }
-        Some(_) => Err("use only one of --launch, --list, --show, --check and --igdb".to_string()),
+        Some(_) => Err("use only one of --launch, --list, --show, --check, --igdb and --igdb-matches".to_string()),
     };
     while let Some(arg) = args.next() {
         // `--flag=value` is the same as `--flag value`
@@ -175,13 +181,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
             }
             "--list" if inline.is_none() => set_action(&mut cli, Action::List)?,
             "--check" if inline.is_none() => set_action(&mut cli, Action::Check)?,
-            "-c" | "--config" | "-s" | "--search" | "--show" | "--launch" | "--igdb" => {
+            "--igdb-matches" if inline.is_none() => set_action(&mut cli, Action::IgdbMatches)?,
+            "-c" | "--config" | "-s" | "--search" | "--filter" | "--show" | "--launch" | "--igdb" => {
                 let value = inline
                     .or_else(|| args.next())
                     .ok_or_else(|| format!("{flag} needs an argument"))?;
                 match flag {
                     "-c" | "--config" => cli.config = Some(PathBuf::from(config::expand(&value))),
                     "-s" | "--search" => cli.search = value,
+                    "--filter" => cli.filter = Some(value),
                     "--show" => set_action(&mut cli, Action::Show(value))?,
                     "--igdb" => set_action(&mut cli, Action::Igdb(value))?,
                     _ => set_action(&mut cli, Action::Launch(value))?,
@@ -207,17 +215,20 @@ pub struct Launched {
 #[derive(Debug, PartialEq)]
 struct Tracker {
     pgid: u32,
-    /// Game name and checkpoint interval in seconds.
-    playtime: Option<(String, u64)>,
+    /// Game name, checkpoint interval in seconds and the playtime file. The file is
+    /// passed along because the copy doesn't read the config and its [paths].
+    playtime: Option<(String, u64, PathBuf)>,
     reopen: Option<Vec<String>>,
 }
 
 impl Tracker {
-    /// `--track <pgid> [--playtime <checkpoint secs> <name>] [--reopen <args>...]`
+    /// `--track <pgid> [--playtime <checkpoint secs> <file> <name>] [--reopen <args>...]`
     fn to_args(&self) -> Vec<String> {
         let mut args = vec!["--track".to_string(), self.pgid.to_string()];
-        if let Some((name, secs)) = &self.playtime {
-            args.extend(["--playtime".to_string(), secs.to_string(), name.clone()]);
+        if let Some((name, secs, file)) = &self.playtime {
+            // arguments are read as UTF-8 anyway (env::args)
+            let file = file.to_string_lossy().into_owned();
+            args.extend(["--playtime".to_string(), secs.to_string(), file, name.clone()]);
         }
         if let Some(reopen) = &self.reopen {
             args.push("--reopen".to_string());
@@ -234,7 +245,9 @@ impl Tracker {
         }
         let pgid = pgid.parse().ok()?;
         let (playtime, rest) = match rest {
-            [f, secs, name, rest @ ..] if f == "--playtime" => (Some((name.clone(), secs.parse().ok()?)), rest),
+            [f, secs, file, name, rest @ ..] if f == "--playtime" => {
+                (Some((name.clone(), secs.parse().ok()?, PathBuf::from(file))), rest)
+            }
             _ => (None, rest),
         };
         let reopen = match rest {
@@ -247,7 +260,7 @@ impl Tracker {
 
     fn run(self) {
         match self.playtime {
-            Some((name, secs)) => playtime::track(self.pgid, &name, Duration::from_secs(secs)),
+            Some((name, secs, file)) => playtime::track(self.pgid, &file, &name, Duration::from_secs(secs)),
             None => playtime::wait(self.pgid),
         }
         if let Some(args) = self.reopen {
@@ -335,20 +348,51 @@ fn run_action(action: Action) -> i32 {
         Err(e) => return fail(e),
     };
 
+    let igdb = || match api.igdb_credentials() {
+        Some((id, secret)) => api_igdb::Client::new(id, secret).map_err(|e| format!("IGDB sign-in failed: {e}")),
+        None => Err("set igdb_client_id and igdb_client_secret under [api] \
+            (or IGDB_CLIENT_ID and IGDB_CLIENT_SECRET)".into()),
+    };
+
     match action {
         Action::Check => unreachable!("handled above"),
         Action::Igdb(name) => {
-            let Some((id, secret)) = api.igdb_credentials() else {
-                return fail("set igdb_client_id and igdb_client_secret under [api] \
-                    (or IGDB_CLIENT_ID and IGDB_CLIENT_SECRET)".into());
+            let mut client = match igdb() {
+                Ok(c) => c,
+                Err(e) => return fail(e),
             };
-            match api_igdb::Client::new(id, secret).and_then(|mut c| c.search(&name)) {
+            match client.search(&name) {
                 Ok(json) => {
                     println!("{}", json.trim_end());
                     0
                 }
                 Err(e) => fail(format!("IGDB search failed: {e}")),
             }
+        }
+        Action::IgdbMatches => {
+            let mut client = match igdb() {
+                Ok(c) => c,
+                Err(e) => return fail(e),
+            };
+            let mut unsure = 0;
+            for g in &games {
+                match client.find(&g.name, g.igdb_id, g.igdb_platform.as_deref()) {
+                    Ok(hit) => {
+                        let (sure, line) = igdb_match(&g.name, g.igdb_id, hit.as_ref());
+                        unsure += usize::from(!sure);
+                        println!("{line}");
+                    }
+                    Err(e) => return fail(format!("IGDB lookup failed for {:?}: {e}", g.name)),
+                }
+            }
+            if unsure > 0 {
+                println!(
+                    "\n{unsure} of {} games aren't an exact match by name; see the candidates \
+                    with --igdb <NAME> and pin the right one with igdb_id",
+                    games.len()
+                );
+            }
+            0
         }
         Action::List => {
             for g in &games {
@@ -374,7 +418,7 @@ fn run_action(action: Action) -> i32 {
                     // like a launch from the window: with playtime on, a small copy of rsgl
                     // stays behind to time the game (on Unix this replaces this process)
                     if pt.enabled && game.playtime {
-                        let playtime = Some((game.name.clone(), pt.checkpoint_minutes * 60));
+                        let playtime = Some((game.name.clone(), pt.checkpoint_minutes * 60, config::playtime_file()));
                         Tracker { pgid, playtime, reopen: None }.start();
                     }
                     0
@@ -382,6 +426,24 @@ fn run_action(action: Action) -> i32 {
                 Err(e) => fail(format!("couldn't start {}: {e}", game.name)),
             }
         }
+    }
+}
+
+/// One line of `--igdb-matches`: the game `name` and what IGDB has for it, with whether
+/// that's surely the game: IGDB's name is the same, or it was pinned with `igdb_id`.
+fn igdb_match(name: &str, igdb_id: Option<u64>, hit: Option<&api_igdb::Hit>) -> (bool, String) {
+    let Some(hit) = hit else {
+        return match igdb_id {
+            Some(id) => (false, format!("?  {name}  ->  IGDB has no game with igdb_id {id}")),
+            None => (false, format!("?  {name}  ->  nothing on IGDB")),
+        };
+    };
+    let year = hit.year().map(|y| format!(" ({y})")).unwrap_or_default();
+    let found = format!("{}{year}, igdb_id {}", hit.name, hit.id);
+    match (igdb_id, hit.is_named(name)) {
+        (Some(_), _) => (true, format!("=  {name}  ->  {found}, pinned")),
+        (None, true) => (true, format!("=  {name}  ->  {found}")),
+        (None, false) => (false, format!("?  {name}  ->  {found}")),
     }
 }
 
@@ -428,7 +490,7 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
-    let Cli { fullscreen, config: config_path, search, action } = cli;
+    let Cli { fullscreen, config: config_path, search, filter, action } = cli;
     if let Some(path) = config_path {
         if !path.is_file() {
             eprintln!("rsgl: {}: config file not found", path.display());
@@ -442,10 +504,15 @@ fn main() -> eframe::Result {
         std::process::exit(run_action(action));
     }
 
-    let (settings, error) = match config::load() {
+    let (mut settings, mut error) = match config::load() {
         Ok(s) => (s, None),
         Err(e) => (Settings::default(), Some(e)),
     };
+    // a title that isn't there shows in the window like a config error, since a
+    // launcher started from a hotkey has no terminal to print it to
+    if let (Some(title), None) = (&filter, &error) {
+        error = settings.topbar.pick_filter(title).err();
+    }
 
     // kept open while the window is up; std opens files close-on-exec, so the
     // tracker below doesn't hold on to it
@@ -470,8 +537,8 @@ fn main() -> eframe::Result {
     if let Some(l) = launched {
         let tracker = Tracker {
             pgid: l.pgid,
-            playtime: (track && l.playtime).then_some((l.name, checkpoint)),
-            // the same arguments, so the reopened window uses the same config, -f and -s
+            playtime: (track && l.playtime).then(|| (l.name, checkpoint, config::playtime_file())),
+            // the same arguments, so the reopened window uses the same config, -f, -s and --filter
             reopen: reopen.then_some(args),
         };
         if tracker.playtime.is_some() || tracker.reopen.is_some() {
@@ -503,7 +570,20 @@ mod tests {
         assert_eq!(parse(&["--show", "Quake"]).unwrap().action, Some(Action::Show("Quake".into())));
         assert_eq!(parse(&["--launch=Left 4 Dead 2"]).unwrap().action, Some(Action::Launch("Left 4 Dead 2".into())));
         assert_eq!(parse(&["--igdb", "Portal 2"]).unwrap().action, Some(Action::Igdb("Portal 2".into())));
+        assert_eq!(parse(&["--igdb-matches"]).unwrap().action, Some(Action::IgdbMatches));
         assert_eq!(parse(&[]).unwrap().action, None);
+    }
+
+    #[test]
+    fn igdb_matches_flag_what_isnt_surely_the_game() {
+        let hit: api_igdb::Hit =
+            serde_json::from_str(r#"{"id": 333, "name": "Quake", "first_release_date": 835228800}"#).unwrap();
+        assert_eq!(igdb_match("quake", None, Some(&hit)), (true, "=  quake  ->  Quake (1996), igdb_id 333".into()));
+        assert_eq!(igdb_match("Quake 4", None, Some(&hit)), (false, "?  Quake 4  ->  Quake (1996), igdb_id 333".into()));
+        let (sure, line) = igdb_match("Quake 1", Some(333), Some(&hit));
+        assert!(sure && line.ends_with(", pinned"), "{line}");
+        assert_eq!(igdb_match("Quake", None, None), (false, "?  Quake  ->  nothing on IGDB".into()));
+        assert!(!igdb_match("Quake", Some(9), None).0);
     }
 
     #[test]
@@ -525,9 +605,13 @@ mod tests {
         let strings = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for t in [
             Tracker { pgid: 42, playtime: None, reopen: None },
-            Tracker { pgid: 42, playtime: Some(("".into(), 300)), reopen: None },
+            Tracker { pgid: 42, playtime: Some(("".into(), 300, "/p/playtime.toml".into())), reopen: None },
             Tracker { pgid: 42, playtime: None, reopen: Some(vec![]) },
-            Tracker { pgid: 42, playtime: Some(("--reopen".into(), 0)), reopen: Some(strings(&["-c", "x", "-f"])) },
+            Tracker {
+                pgid: 42,
+                playtime: Some(("--reopen".into(), 0, "--reopen".into())),
+                reopen: Some(strings(&["-c", "x", "-f"])),
+            },
         ] {
             assert_eq!(Tracker::from_args(&t.to_args()), Some(t));
         }
@@ -539,9 +623,10 @@ mod tests {
 
     #[test]
     fn options_still_work_alongside_actions() {
-        let cli = parse(&["-f", "-s", "t:coop", "--config=/x.toml", "--list"]).unwrap();
+        let cli = parse(&["-f", "-s", "t:coop", "--filter=NES", "--config=/x.toml", "--list"]).unwrap();
         assert!(cli.fullscreen);
         assert_eq!(cli.search, "t:coop");
+        assert_eq!(cli.filter.as_deref(), Some("NES"));
         assert_eq!(cli.config, Some(PathBuf::from("/x.toml")));
         assert_eq!(cli.action, Some(Action::List));
     }

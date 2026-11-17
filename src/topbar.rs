@@ -1,6 +1,7 @@
 //! The bar above the grid: widgets from `[topbar]`, in a left, center and right zone.
 use crate::{
     config::{self, MenuEntry, Toggles, ToolCfg, Vars},
+    search::Query,
     status::{Checker, Part, PartCfg},
 };
 use serde::Deserialize;
@@ -48,6 +49,16 @@ enum WidgetCfg {
     Toggle { title: String, env: Option<String>, var: Option<String>, on: String, off: Option<String> },
     /// A dropdown of the orders for the grid. All of them by default, starting with the first.
     Sort { options: Option<Vec<SortBy>>, default: Option<SortBy> },
+    /// Searches to narrow the grid to, on top of what's typed, picked by `title`. The
+    /// first one by default.
+    Filter { options: Vec<FilterCfg>, default: Option<String> },
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct FilterCfg {
+    title: String,
+    filter: String,
 }
 
 pub enum Widget {
@@ -57,6 +68,7 @@ pub enum Widget {
     Menu { title: String, entries: Vec<MenuEntry> },
     Toggle(Toggle),
     Sort(Sort),
+    Filter(Filter),
 }
 
 /// What the search box suggests the rest of, from the games the rest of the search shows.
@@ -125,11 +137,26 @@ impl SortBy {
     }
 }
 
-/// The sort dropdown. It starts from `default` every time rsgl starts or reloads.
+/// The sort dropdown. It starts from `default` every time rsgl starts or reloads, and
+/// keeps its pick when a toggle builds the top bar again.
 pub struct Sort {
     pub options: Vec<SortBy>,
     /// Which of `options` it is now.
     pub current: usize,
+}
+
+/// The filter selector. Like the sort, it starts from `default` every time rsgl starts,
+/// and keeps its pick when a toggle builds the top bar again or the config is reloaded.
+pub struct Filter {
+    pub options: Vec<FilterOption>,
+    /// Which of `options` it is now.
+    pub current: usize,
+}
+
+pub struct FilterOption {
+    pub title: String,
+    /// What it narrows the grid to, ANDed with the search box. An empty one shows everything.
+    pub query: Query,
 }
 
 impl Widget {
@@ -138,7 +165,7 @@ impl Widget {
         match self {
             Widget::Button(tool) => std::slice::from_ref(tool),
             Widget::Menu { entries, .. } => entries,
-            Widget::Label(_) | Widget::Search { .. } | Widget::Toggle(_) | Widget::Sort(_) => &[],
+            Widget::Label(_) | Widget::Search { .. } | Widget::Toggle(_) | Widget::Sort(_) | Widget::Filter(_) => &[],
         }
     }
 }
@@ -167,6 +194,7 @@ impl Topbar {
         let mut uses_igdb = false;
         let mut search_at: Option<String> = None;
         let mut sort_at: Option<String> = None;
+        let mut filter_at: Option<String> = None;
         let mut toggle_at: BTreeMap<String, String> = BTreeMap::new();
         let mut zone = |side: Vec<WidgetCfg>, which: &str| -> Result<Vec<Widget>, String> {
             let mut out = Vec::new();
@@ -266,6 +294,27 @@ impl Topbar {
                         sort_at = Some(at);
                         Widget::Sort(Sort { options, current })
                     }
+                    WidgetCfg::Filter { options, default } => {
+                        // one, so prev_filter and next_filter know which to switch
+                        if let Some(first) = &filter_at {
+                            return Err(format!("{at}: there's already a filter ({first})"));
+                        }
+                        if options.is_empty() {
+                            return Err(format!("{at}: filter has no options"));
+                        }
+                        if let Some(twice) = options.iter().enumerate().find(|&(k, o)| options[..k].iter().any(|p| p.title == o.title)) {
+                            return Err(format!("{at}: filter has {:?} twice", twice.1.title));
+                        }
+                        let current = match default {
+                            Some(d) => options.iter().position(|o| o.title == d).ok_or_else(|| {
+                                format!("{at}: the default, {d:?}, isn't one of the filter's titles")
+                            })?,
+                            None => 0,
+                        };
+                        filter_at = Some(at);
+                        let options = options.into_iter().map(|o| FilterOption { query: Query::parse(&o.filter), title: o.title });
+                        Widget::Filter(Filter { options: options.collect(), current })
+                    }
                 });
             }
             Ok(out)
@@ -316,12 +365,31 @@ impl Topbar {
     }
 
     /// Switches each toggle on or off like the one in the same place in `other`, a top
-    /// bar from the same config.
-    pub fn copy_toggles(&mut self, other: &Topbar) {
+    /// bar from the same config, and keeps its sort and filter, see `keep_picks`.
+    pub fn copy_state(&mut self, other: &Topbar) {
         let mine = [&mut self.left, &mut self.center, &mut self.right].into_iter().flatten();
         for (mine, theirs) in mine.zip(other.zones().into_iter().flatten()) {
             if let (Widget::Toggle(t), Widget::Toggle(o)) = (mine, theirs) {
                 t.on = o.on;
+            }
+        }
+        self.keep_picks(other);
+    }
+
+    /// Picks the order and filter `other` is on, where this top bar has them too: by
+    /// the order and the filter's title, so it works for a reloaded config. What's
+    /// gone stays on its default.
+    pub fn keep_picks(&mut self, other: &Topbar) {
+        let sort = other.sort();
+        let filter = other.filter().map(|f| f.title.as_str());
+        for w in [&mut self.left, &mut self.center, &mut self.right].into_iter().flatten() {
+            match w {
+                Widget::Sort(s) => s.current = s.options.iter().position(|&o| o == sort).unwrap_or(s.current),
+                Widget::Filter(f) => {
+                    let at = f.options.iter().position(|o| Some(o.title.as_str()) == filter);
+                    f.current = at.unwrap_or(f.current);
+                }
+                _ => {}
             }
         }
     }
@@ -365,6 +433,26 @@ impl Topbar {
         sort.unwrap_or(SortBy::Name)
     }
 
+    /// The filter selector, if there is one.
+    pub fn filter_widget(&self) -> Option<&Filter> {
+        self.zones().into_iter().flatten().find_map(|w| match w {
+            Widget::Filter(f) => Some(f),
+            _ => None,
+        })
+    }
+
+    fn filter_mut(&mut self) -> Option<&mut Filter> {
+        [&mut self.left, &mut self.center, &mut self.right].into_iter().flatten().find_map(|w| match w {
+            Widget::Filter(f) => Some(f),
+            _ => None,
+        })
+    }
+
+    /// The filter the grid is narrowed to now; None without a filter selector.
+    pub fn filter(&self) -> Option<&FilterOption> {
+        self.filter_widget().map(|f| &f.options[f.current])
+    }
+
     /// What the search box completes; nothing without one.
     pub fn autocomplete(&self) -> &[Complete] {
         let search = self.zones().into_iter().flatten().find_map(|w| match w {
@@ -379,6 +467,38 @@ impl Topbar {
         let Widget::Sort(s) = self.widget_mut(id) else { panic!("widget {id:?} isn't a sort") };
         assert!(k < s.options.len(), "sort option {k} of {}", s.options.len());
         s.current = k;
+    }
+
+    /// Picks option `k` of filter `id`. Panics if it isn't a filter.
+    pub fn set_filter(&mut self, id: WidgetId, k: usize) {
+        let Widget::Filter(f) = self.widget_mut(id) else { panic!("widget {id:?} isn't a filter") };
+        assert!(k < f.options.len(), "filter option {k} of {}", f.options.len());
+        f.current = k;
+    }
+
+    /// Picks the filter `--filter` names, by title like `--show` finds a game (see
+    /// `config::pick`). The error says why there's none to pick.
+    pub fn pick_filter(&mut self, query: &str) -> Result<(), String> {
+        let Some(f) = self.filter_mut() else { return Err("--filter: the top bar has no filter".to_string()) };
+        let titles: Vec<&str> = f.options.iter().map(|o| o.title.as_str()).collect();
+        match config::pick(&titles, query) {
+            Ok(k) => {
+                f.current = k;
+                Ok(())
+            }
+            Err(none) if none.is_empty() => {
+                Err(format!("--filter: no filter matches {query:?}; there's {}", titles.join(", ")))
+            }
+            Err(many) => Err(format!("--filter: {query:?} matches {} filters: {}", many.len(), many.join(", "))),
+        }
+    }
+
+    /// Moves the filter `by` options along, going around at either end. Does nothing
+    /// without a filter selector.
+    pub fn step_filter(&mut self, by: isize) {
+        if let Some(f) = self.filter_mut() {
+            f.current = (f.current as isize + by).rem_euclid(f.options.len() as isize) as usize;
+        }
     }
 }
 
@@ -582,7 +702,7 @@ mod tests {
                                           { type = "toggle", title = "MangoHud", env = "MANGOHUD", on = "1" }]"#)
         .unwrap();
         t.flip((0, 1));
-        again.copy_toggles(&t);
+        again.copy_state(&t);
         assert_eq!((again.var_values(), again.toggles()["MANGOHUD"].as_deref()), (vec![("term", "")], Some("1")));
     }
 
@@ -637,6 +757,92 @@ mod tests {
         let e = topbar(r#"left = [{ type = "sort" }]
                            right = [{ type = "sort" }]"#).err().unwrap();
         assert!(e.contains("right widget 1: there's already a sort (left widget 1)"), "{e}");
+    }
+
+    const FILTER: &str = r#"left = [{ type = "filter", options = [
+        { title = "All", filter = "" },
+        { title = "NES", filter = "t:nes" },
+        { title = "LAN", filter = "t:pc t:lan" },
+    ] }]"#;
+
+    fn filter(t: &Topbar) -> &str {
+        &t.filter().expect("a filter").title
+    }
+
+    #[test]
+    fn filters_start_on_the_first_or_default_and_go_around() {
+        assert!(Topbar::default().filter().is_none(), "no filter widget");
+        let mut t = topbar(FILTER).unwrap();
+        assert_eq!(filter(&t), "All");
+        assert_eq!(t.filter().unwrap().query, Query::default(), "an empty filter shows everything");
+        t.step_filter(-1);
+        assert_eq!(filter(&t), "LAN", "around from the first to the last");
+        assert_eq!(t.filter().unwrap().query.tags, ["pc", "lan"]);
+        t.step_filter(1);
+        assert_eq!(filter(&t), "All");
+        t.set_filter((0, 0), 1);
+        assert_eq!(filter(&t), "NES");
+        assert!(t.widget((0, 0)).tools().is_empty(), "a filter runs nothing");
+
+        let t = topbar(&FILTER.replace("] }]", "], default = \"LAN\" }]")).unwrap();
+        assert_eq!(filter(&t), "LAN");
+    }
+
+    #[test]
+    fn the_command_line_picks_a_filter_by_title() {
+        let mut t = topbar(&FILTER.replace("\"LAN\"", "\"LAN Party\"")).unwrap();
+        t.pick_filter("nes").unwrap();
+        assert_eq!(filter(&t), "NES", "any case");
+        t.pick_filter("party").unwrap();
+        assert_eq!(filter(&t), "LAN Party", "part of the only title containing it");
+        let e = t.pick_filter("SNES").err().unwrap();
+        assert!(e.contains("no filter matches \"SNES\"; there's All, NES, LAN Party"), "{e}");
+        let e = t.pick_filter("n").err().unwrap();
+        assert!(e.contains("matches 2 filters: NES, LAN Party"), "{e}");
+        assert_eq!(filter(&t), "LAN Party", "a failed pick changes nothing");
+        let e = Topbar::default().pick_filter("NES").err().unwrap();
+        assert!(e.contains("the top bar has no filter"), "{e}");
+    }
+
+    #[test]
+    fn the_sort_and_filter_are_kept_by_value_across_configs() {
+        let mut old = topbar(&format!("{FILTER}\nright = [{{ type = \"sort\" }}]")).unwrap();
+        old.set_filter((0, 0), 2);
+        old.set_sort((2, 0), 3);
+        // reloaded: moved to the other zone, reordered, with fewer orders
+        let reloaded = r#"left = [{ type = "sort", options = ["year", "name"], default = "name" }]
+                          right = [{ type = "filter", options = [{ title = "LAN", filter = "t:lan" }, { title = "All", filter = "" }], default = "All" }]"#;
+        let mut new = topbar(reloaded).unwrap();
+        new.keep_picks(&old);
+        assert_eq!((new.sort(), filter(&new)), (SortBy::Year, "LAN"));
+
+        old.set_filter((0, 0), 1);
+        old.set_sort((2, 0), 2);
+        let mut new = topbar(reloaded).unwrap();
+        new.keep_picks(&old);
+        assert_eq!((new.sort(), filter(&new)), (SortBy::Name, "All"), "gone: the default");
+
+        let mut again = topbar(&format!("{FILTER}\nright = [{{ type = \"sort\" }}]")).unwrap();
+        again.copy_state(&old);
+        assert_eq!((again.sort(), filter(&again)), (SortBy::Playtime, "NES"), "a toggle's rebuild keeps them too");
+    }
+
+    #[test]
+    fn filter_mistakes_are_errors() {
+        let e = topbar(r#"left = [{ type = "filter", options = [] }]"#).err().unwrap();
+        assert!(e.contains("left widget 1: filter has no options"), "{e}");
+        let e = topbar(r#"left = [{ type = "filter", options = [{ title = "A", filter = "" }, { title = "A", filter = "t:a" }] }]"#)
+            .err()
+            .unwrap();
+        assert!(e.contains("filter has \"A\" twice"), "{e}");
+        let e = topbar(&FILTER.replace("] }]", "], default = \"SNES\" }]")).err().unwrap();
+        assert!(e.contains("the default, \"SNES\", isn't one of the filter's titles"), "{e}");
+        let e = topbar(r#"left = [{ type = "filter", options = [{ title = "A", search = "t:a" }] }]"#).err().unwrap();
+        assert!(e.contains("unknown field `search`"), "{e}");
+        let e = topbar(&format!("{FILTER}\nright = [{{ type = \"filter\", options = [{{ title = \"B\", filter = \"\" }}] }}]"))
+            .err()
+            .unwrap();
+        assert!(e.contains("right widget 1: there's already a filter (left widget 1)"), "{e}");
     }
 
     #[test]

@@ -19,9 +19,12 @@ titles and the status bar and search with `g:`.
 - Cover-art grid with search-as-you-type filtering
 - Variables (`{name}`) and a global `[env]`, so paths, launch commands and
   environment settings aren't repeated in the config
-- Command-line `--launch`, `--list`, `--show`, `--check` and `--igdb`, for hotkeys and scripts
+- Command-line `--launch`, `--list`, `--show`, `--check`, `--igdb` and `--igdb-matches`, for hotkeys and scripts
 - Tags, with `t:tag` filtering in the search bar, and `g:genre` with IGDB genres
+- ROM folders: every file in a folder becomes a game, see [ROMs](#roms)
 - Configurable right-click menu per game: tools, or alternate ways to launch
+- Steam-like installs, updates and save syncing from your own server, all in
+  config (see [Recipes](#recipes))
 - Full keyboard and gamepad control with rebindable keys and buttons, mouse works too
 - Automatic cover and hero downloads from SteamGridDB (optional)
 - Blurred, crossfading background for the selected game
@@ -54,13 +57,15 @@ see [Windows](#windows) for the differences.
 
 rsgl reads the first of these files that exists:
 
-1. `$XDG_CONFIG_HOME/rsgl/rsgl.toml` (usually `~/.config/rsgl/rsgl.toml`;
+1. `rsgl.toml` in the same folder as the rsgl executable (see
+   [Portable setup](#portable-setup))
+2. `$XDG_CONFIG_HOME/rsgl/rsgl.toml` (usually `~/.config/rsgl/rsgl.toml`;
    on Windows `%APPDATA%\rsgl\rsgl.toml`)
-2. `~/.rsgl.toml`
+3. `~/.rsgl.toml`
 
 Pass `-c <file>` to use a different file instead (see [Command line](#command-line)).
 
-If neither exists, the first run writes an example config to
+If none exists, the first run writes an example config to
 `~/.config/rsgl/rsgl.toml` and shows a message telling you to edit it and
 press F5.
 
@@ -87,6 +92,8 @@ checkpoint_minutes = 5   # save a running session every N minutes, 0 = only on e
 steamgriddb_key = "your-key-here"
 igdb_client_id = "your-client-id"          # IGDB metadata, fills in {year} and {genres}
 igdb_client_secret = "your-client-secret"
+hasheous = false         # name [[roms]] files by their contents, see ROMs
+hasheous_url = "http://nas:5000"           # a self-hosted Hasheous, default hasheous.org
 
 [env]
 WINEDEBUG = "-all"       # set for every game; a game's own env wins
@@ -185,7 +192,9 @@ env = { EDITOR = "kate" }
 | `action`  | A built-in instead of `exec`. The only one is `"open_folder"`: open the workdir. |
 | `workdir` | Optional. Defaults to the game's `workdir`.                                      |
 | `env`     | Optional. Added to the game's `env`; the entry wins if both set a variable.      |
+| `vars`    | Optional. [Variables](#variables) for this entry, on top of the game's.          |
 | `launch`  | Optional, default `false`. See below.                                            |
+| `for`     | Optional, top-level entries only. `"game"` or `"rom"`, see below.                |
 
 - **Tools** (`launch = false`) run in the background and rsgl stays open. They
   don't count toward playtime.
@@ -194,8 +203,63 @@ env = { EDITOR = "kate" }
   is off, globally or for the game).
 - Entries run exactly like a game's `exec`: through the shell, with `~`
   expanded, and printing to your terminal if you started rsgl from one.
+- **`{exec}`** is the game's `exec` as written, with the entry's `vars` filled
+  in. That makes a shared alternate launch a few lines, for every game:
+
+  ```toml
+  [vars]
+  gs = "gamescope -w 3440 -h 1440 --"
+
+  [[right_click]]
+  title = "Launch without gamescope"
+  exec = "{exec}"          # the game's "{gs} wine game.exe" becomes " wine game.exe"
+  vars = { gs = "" }
+  launch = true
+  ```
+
+  An entry's `vars` only reach its own `exec`, `workdir` and `env` (and `{exec}`);
+  the `workdir` and `env` it gets from the game stay as the game has them.
+- Entries also know about the game they're shown for:
+
+  | Variable    | Value                                                                  |
+  | ----------- | ---------------------------------------------------------------------- |
+  | `{name}`    | The game's name, without [`{year}`](#variables)                         |
+  | `{grid}`    | Full path of its cover (`cover`, or the downloaded one); blank if none  |
+  | `{hero}`    | Full path of its downloaded hero; blank if none                         |
+  | `{workdir}` | The game's `workdir`, even if the entry has its own; blank if none      |
+  | `{exec}`    | The game's `exec`, see above                                            |
+
+  `{grid}` and `{hero}` are what's on disk when the config is loaded, so art
+  downloaded since shows up after F5. A variable of your own with one of these
+  names wins. They're filled in as they are, so quote them for the shell: a
+  name like "Kane's Wrath" breaks inside single quotes, so use double quotes:
+
+  ```toml
+  [[right_click]]
+  title = "Uninstall"
+  exec = '''test -n "{path}" && zenity --question --text="Delete {name}?" && rm -rf "{games}/{path}"'''
+  workdir = "{games}"
+  ```
 - A top-level `[[right_click]]` applies to every game and comes first, then the
-  game's own entries. A game with no entries at all just opens its `workdir`
+  game's own entries. **`for`** narrows it: `for = "game"` shows it only for
+  `[[game]]` entries, `for = "rom"` only for [`[[roms]]`](#roms) files. An entry
+  that isn't shown for a game isn't filled in for it either, so a `for = "game"`
+  entry can use `{path}` without ROMs defining it, and a `for = "rom"` one can
+  use `{rom}`:
+
+  ```toml
+  [[right_click]]
+  title = "Uninstall"
+  for = "game"
+  exec = '''test -n "{path}" && zenity --question --text="Delete {name}?" && rm -rf "{games}/{path}"'''
+  workdir = "{games}"
+
+  [[right_click]]
+  title = "Delete ROM"
+  for = "rom"
+  exec = '''zenity --question --text="Delete {name}?" && rm "{rom}"'''
+  ```
+ A game with no entries at all just opens its `workdir`
   when you right-click it. Otherwise the menu always opens, even for one entry.
 - `action = "open_folder"` is greyed out when there's no `workdir` to open, and
   works the same on Windows, where `xdg-open` doesn't exist.
@@ -260,7 +324,9 @@ workdir = "{games}/CommandConquer3TiberiumWars"
   value from the window, like `--mangoapp` in `gs` above.
 - **Menu entries** see the variables of the game they're shown for. A shared
   `[[right_click]]` entry can use a per-game variable like `{dir}`, but then
-  every game must define it.
+  every game must define it. An entry's own `vars` win over the game's, and
+  `{exec}`, `{name}`, `{grid}`, `{hero}` and `{workdir}` are the game's, see
+  [Right-click menu](#right-click-menu).
 - **Values** can be strings, numbers or booleans. Arrays and tables aren't
   allowed.
 - **Literal braces:** write `{{` and `}}`, for example `awk '{{print $1}}'`.
@@ -352,6 +418,100 @@ tags = ["coop", "fps"]
   something like `local-mp` or `local_mp`.
 - The selected game's tags are shown in the status bar.
 
+### ROMs
+
+Instead of one `[[game]]` per ROM, point `[[roms]]` at a folder and every file
+with one of the `extensions` becomes a game:
+
+```toml
+[vars]
+cores = "~/.config/retroarch/cores"
+
+[[roms]]
+path = "~/roms/snes"
+extensions = ["sfc", "smc", "zip"]
+exec = 'retroarch -L {cores}/snes9x_libretro.so "{rom}"'
+tags = ["snes"]                  # optional, so t:snes shows just these
+name = "{igdb_name} (SNES)"      # optional, what the card shows, see below
+igdb_platform = "snes"           # optional, only match IGDB games on this platform
+workdir = "~/roms"               # optional, defaults to path
+env = { SOME_VAR = "value" }     # optional
+vars = { core = "snes9x" }       # optional, like a game's own vars
+files."F-Zero (USA).sfc" = { igdb_id = 1234 }   # optional, one file's settings
+files."bios.sfc" = { hidden = true }
+```
+
+- The name is the file name without its extension and without groups in
+  parentheses or brackets, so `Super Mario World (USA) [!].sfc` is "Super
+  Mario World". That's what IGDB is searched for, and what playtime and
+  `--launch` go by.
+- `name` sets what the card shows. It can use the ROM's vars, `{year}` and
+  `{igdb_name}`, IGDB's name for the game: `"{igdb_name} ({year})"` shows
+  `tgm2.zip` as "Tetris: The Grand Master 2 (2000)". Until IGDB has a name,
+  `{igdb_name}` is the file's. It only changes what's shown: playtime, art and
+  `--launch` still go by the file's name, so adding it later loses nothing.
+  `{igdb_name}` needs [IGDB credentials](#igdb-credentials), and `rsgl
+  --igdb-matches` shows what IGDB picked for each ROM.
+- With IGDB credentials, a ROM's art is searched on SteamGridDB by IGDB's name
+  rather than the file's, since file names often miss ("1080 Snowboarding" is
+  "1080° Snowboarding"). The first time IGDB names a ROM, the games reload once
+  the lookups are through, to fetch its art again.
+- `igdb_platform` limits the IGDB search to one platform, so a remake or a
+  same-named game on another system isn't picked. It takes IGDB's slug for the
+  platform, the last part of its page URL (`igdb.com/platforms/n64` is `n64`):
+  `nes`, `snes`, `n64`, `gb`, `gbc`, `gba`, `arcade` and so on. A slug IGDB
+  doesn't have is reported once in the terminal, and those ROMs get no IGDB data;
+  `rsgl --igdb-matches` stops on it. Adding or changing it looks the folder's
+  ROMs up again on the next start. Files with a pinned `igdb_id` aren't searched,
+  so it doesn't apply to them.
+- `files` sets things for single files, keyed by the exact file name:
+  `igdb_id`, `steamgriddb_id`, `grid_id` and `hero_id` work like on a
+  `[[game]]`, and `hidden = true` leaves a file that isn't a game (a BIOS zip)
+  out of the grid. Use them when IGDB or SteamGridDB picks the wrong game;
+  `igdb_id` alone is usually enough, since it fixes `{igdb_name}`, `{year}` and
+  the art search. An id here beats Hasheous's. A file name that matches no
+  file is a warning, not an error. Keep the dotted `files."x" = {...}` form:
+  a `[roms.files."x"]` header works too, but only after the block's other keys.
+- `{rom}` is the file's full path. Quote it in `exec`, since ROM names have
+  spaces.
+- `[vars]`, `[env]` and `[[right_click]]` apply like for any game, and `path`
+  can use `[vars]` too. Give entries that only make sense for one kind a
+  [`for`](#right-click-menu), like `for = "game"` on an Uninstall that deletes
+  a game's folder. `[defaults]` `workdir` doesn't, since the folder is the default.
+- Only the folder itself is scanned, not its subfolders. Extensions match in
+  any case.
+- The folder is scanned on start and on F5. One that can't be read (say, a
+  drive that isn't plugged in) is a warning in the terminal and in `--check`,
+  and the rest of the library still loads.
+- Two ROMs that end up with the same name (`Game (USA)` and `Game (Europe)`)
+  share playtime and art; `--check` warns about it.
+
+#### Hasheous
+
+With `hasheous = true` under `[api]`, rsgl identifies ROMs by their contents on
+[Hasheous](https://hasheous.org), which matches files against the No-Intro,
+Redump and TOSEC sets. An identified ROM gets the game's proper name instead of
+its file name, and the IGDB and SteamGridDB ids Hasheous has for it, so art and
+`{year}` don't depend on a name search. It's off by default, since every ROM is
+read once to hash it and the hashes are sent to hasheous.org. No key is needed.
+
+- ROMs are hashed (SHA-1) and looked up in the background when the window opens.
+  Once that's done, the games are loaded again with their new names, like F5.
+  `--launch` and `--show` only use what's already been looked up.
+- What Hasheous says is cached in `~/.cache/rsgl/hasheous.toml` by file path, so
+  each ROM is only hashed once. A file that changes is looked up again, and so is
+  one whose lookup failed (no network); a file Hasheous doesn't know is cached as
+  unknown and keeps its file name.
+- A `.zip` is matched by the one file in it. A zip with several files keeps its
+  file name.
+- A ROM's name is what its playtime and art go by, so turning Hasheous on (or a
+  ROM getting identified) starts it over under the new name.
+- `hasheous_url` points rsgl at your own Hasheous instead, e.g. the one Gaseous
+  runs; it's the server's address, with or without `/api/v1`. A URL that isn't
+  a Hasheous API stops the lookups with a warning instead of marking every ROM
+  unknown. ROMs already cached aren't asked again after switching servers;
+  delete `hasheous.toml` for that.
+
 ### Genres
 
 With [IGDB credentials](#igdb-credentials) set, `g:` filters by the genres IGDB
@@ -428,6 +588,12 @@ The bar above the grid holds widgets in three zones: `left`, `center` and
 left = [
   { type = "label", text = "MangoHud {env:MANGOHUD}", bold = true },
   { type = "button", title = "Steam", exec = "steam -bigpicture" },
+  { type = "filter", options = [
+      { title = "All", filter = "" },
+      { title = "PC Games", filter = "t:pc" },
+      { title = "LAN", filter = "t:pc t:lan" },
+      { title = "Need for Speed", filter = "Need for Speed" },
+  ] },
 ]
 center = [
   { type = "search", placeholder = "Find something to play…", autocomplete = ["names", "tags", "genres"] },
@@ -451,6 +617,7 @@ right = [
 | `menu`   | `title`, and `entries`: a list of `title`, `exec`, `workdir` and `env`    |
 | `toggle` | `title`, and `env` or `var`, a variable it sets to `on` or `off`         |
 | `sort`   | `options`, orders for the grid to pick from, and the `default` one        |
+| `filter` | `options`: a list of `title` and `filter`, a search; and the `default` title |
 
 - The center zone stays centered. The left and right zones get the room beside
   it, and their text is cut off rather than running into it; with something
@@ -502,16 +669,32 @@ right = [
   first; without [playtime](#playtime) on, they're by name), or `year` (IGDB's,
   newest first). Games without one go last, in name order. `options` defaults
   to all four and `default` to the first option. It starts from `default`
-  every time, like a toggle, and there's at most one. Picking an order selects
+  every time rsgl starts, and there's at most one. Picking an order selects
   its first game; when IGDB data reorders the grid, the selection stays on its
   game.
+- **The filter** narrows the grid to one of its searches, shown as
+  `< PC Games >`. A `filter` is anything you could type in the search bar
+  (`t:` tags, `g:` genres, name text), and the grid shows the games that match
+  both it and what's typed, so you can pick `< NES >` and type `mario`. The
+  search bar itself isn't touched, and Esc doesn't clear the filter.
+  `filter = ""` shows every game, so put an "All" option first if you want
+  one; there's no hidden one. The arrows (or `prev_filter`/`next_filter`,
+  Ctrl+PageUp/PageDown and LB/RB by default) switch it, going around at the
+  ends, and a click on the title opens the list. It starts on `default`, else
+  the first option, every time rsgl starts (or on the one
+  [`--filter`](#command-line) names); there's at most one, and titles
+  can't repeat. Switching selects the grid's first game.
+  [`--check`](#command-line) warns about a `t:` tag that no game has, which is
+  likely a typo.
+- The sort and filter stay on what you picked when the config is reloaded,
+  as long as the order or filter title is still there.
 - Multi-line inline tables, like the `menu` above, need TOML 1.1, which rsgl reads.
 - **With the keyboard or a gamepad**, up on the top row of the grid (or with no
-  games shown) moves to the bar's first button, menu, toggle or sort. Left/right move
+  games shown) moves to the bar's first button, menu, toggle, sort or filter. Left/right move
   along them, launch uses one, down or back go back to the grid. Only a fresh
   press of up goes into the bar, so holding it to scroll stops at the top row.
   The search box is skipped; typing still goes to it.
-- A button, menu, toggle or sort cut off by a narrow window is skipped too.
+- A button, menu, toggle, sort or filter cut off by a narrow window is skipped too.
 
 ### Playtime
 
@@ -527,7 +710,8 @@ bar.
 - Running sessions are saved every `checkpoint_minutes`, so a crash or shutdown
   loses at most that much.
 - Time while the machine is suspended isn't counted.
-- Totals are stored by game name in `~/.local/share/rsgl/playtime.toml`.
+- Totals are stored by game name in `~/.local/share/rsgl/playtime.toml`
+  (see [Portable setup](#portable-setup) to keep them elsewhere).
   Renaming a game in the config starts it from zero (or rename the entry in
   that file too).
 
@@ -545,7 +729,7 @@ on screen. It uses the same background process as playtime tracking (and works
 with playtime off), so it has the same limits: a game that hands off to Steam,
 Lutris and the like "exits" right away and the launcher reopens immediately.
 
-- It reopens with the same command-line flags it was started with (`-c`, `-f`, `-s`).
+- It reopens with the same command-line flags it was started with (`-c`, `-f`, `-s`, `--filter`).
 - Closing the launcher yourself (Esc, the window's close button) ends the loop.
 - Games started with `--launch` don't reopen it.
 
@@ -569,7 +753,7 @@ Everything works the same on Windows apart from the points below.
   not tracked properly, so set `playtime = false` on those. When you launch a
   game, rsgl starts a tiny hidden copy of itself to do the waiting and the
   window process exits.
-- **Folders:** the config is in `%APPDATA%\rsgl`, the cache in
+- **Folders:** the config is in `%APPDATA%\rsgl` (or next to `rsgl.exe`), the cache in
   `%LOCALAPPDATA%\rsgl` and the playtime file in `%APPDATA%\rsgl\playtime.toml`.
   A menu's `open_folder` action opens the game's folder in Explorer.
 - **Terminal output:** release builds are GUI programs. Run from `cmd` or
@@ -595,14 +779,30 @@ IGDB fills in [`{year}`](#variables) in game names, `{year}` and `{genres}` in
 the [status bar](#status-bar), and the genres that [`g:`](#genres) searches.
 With credentials set, every game is looked up by name in the background when the
 window opens, and the result is cached in `~/.cache/rsgl/igdb_meta.toml`, so
-each game is only looked up once (a game IGDB doesn't know is cached as empty).
-Delete a game's entry there to look it up again.
+each game is only looked up once (a game IGDB doesn't know is cached as empty,
+except a ROM, which is asked again on the next start). Delete a game's entry there
+to look it up again.
 
 The name search picks the result with the exact same name, else the first one
 with a release date, which is sometimes the wrong game. Set `igdb_id` on the
 game to skip the search. `rsgl --igdb NAME` prints the raw search results, with
 each game's `id` (e.g. `rsgl --igdb "Portal 2" > portal.json`). Adding, changing
 or removing an `igdb_id` looks the game up again on the next start.
+
+To see which IGDB game every game got, run `rsgl --igdb-matches`:
+
+```
+=  Quake  ->  Quake (1996), igdb_id 333
+?  Quake 4  ->  Quake (1996), igdb_id 333
+=  Doom  ->  DOOM (1993), igdb_id 673, pinned
+?  Some Mod  ->  nothing on IGDB
+```
+
+`=` is an exact match by name or a game with `igdb_id` set; `?` is IGDB's best
+guess, worth a look (`rsgl --igdb-matches | grep '^?'`). It searches IGDB again
+for every game, the same way the window does, rather than reading the cache.
+Lookups are spaced to IGDB's 4 requests a second; if IGDB still answers 429
+Too Many Requests, rsgl waits 15 seconds and tries again (up to 4 times).
 
 IGDB signs in through Twitch, so register an application at
 [dev.twitch.tv/console](https://dev.twitch.tv/console) (any name, OAuth redirect
@@ -611,6 +811,118 @@ secret into `igdb_client_id` and `igdb_client_secret`. The `IGDB_CLIENT_ID` and
 `IGDB_CLIENT_SECRET` environment variables take priority over the config file.
 The access token Twitch hands out is cached in `~/.cache/rsgl/igdb_token.toml`
 and reused until it's about to expire (roughly 60 days).
+
+## Recipes
+
+Steam-like features you can build from config alone.
+
+### Installing games from a server
+
+Keep your games on a server and install, update, check and uninstall them from
+the right-click menu, with a top bar menu to update everything at once:
+
+```toml
+[vars]
+games = "~/.wine/drive_c/games"
+remote = "user@192.168.0.100:/home/user/data/games"
+term = "xterm -hold -e"   # or "foot --hold", "kitty --hold", "alacritty --hold -e"
+sync = "rsync -avP"
+
+[defaults]
+workdir = "{games}/{path}/"
+
+[topbar]
+right = [
+  { type = "menu", title = "Sync", entries = [
+      { title = "Update installed", exec = '''{term} sh -c 'for d in {games}/*/; do {sync} {remote}/"$(basename "$d")"/ "$d"; done' ''' },
+      { title = "Pull everything", exec = "{term} {sync} {remote}/ {games}/" },
+  ] },
+]
+
+[[right_click]]
+title = "Install / update"
+exec = "{term} {sync} {remote}/{path}/ {games}/{path}/"
+workdir = "{games}"
+
+[[right_click]]
+title = "Verify files"
+exec = "{term} rsync -rc --dry-run --itemize-changes {remote}/{path}/ {games}/{path}/"
+workdir = "{games}"
+
+[[right_click]]
+title = "Uninstall"
+exec = '''test -n "{path}" && zenity --question --title=Uninstall --text="Delete {name}?" && rm -rf "{games}/{path}"'''
+workdir = "{games}"
+
+[[game]]
+name = "Command & Conquer 3: Kane's Wrath"
+exec = "wine CNC3EP1.exe"
+vars = { path = "CommandConquer3KaneWrath" }
+
+[[game]]
+name = "Unreal Tournament 2004"
+exec = "./UT2004"
+workdir = "{games}/{path}/System/"   # its own workdir wins over [defaults]
+vars = { path = "UnrealTournament2004" }
+```
+
+**The server needs** an ssh server you can log in to, `rsync` installed (rsync
+runs on both ends), and read access to the games folder. Each game is a folder
+there named like its `path`. Set up ssh key auth (`ssh-copy-id user@192.168.0.100`):
+"Update installed" logs in once per game, and anything run without `{term}`
+has no terminal to type a password into (see [Game output](#game-output)).
+
+- **Not installed games are dimmed**, since their `workdir` doesn't exist yet,
+  and light up when the install finishes. That's why the menu entries use
+  `workdir = "{games}"` instead of the game's own: rsgl won't start anything
+  in a folder that doesn't exist. Create `{games}` once before the first install.
+- **Every game needs `path`**, because top-level `[[right_click]]` entries are
+  shown for every game. With [`[[roms]]`](#roms) as well, add `for = "game"` to
+  these entries: ROMs have no `path`, and Uninstall would delete the wrong thing.
+- **Trailing slashes matter:** `rsync -a src/foo/ dst/foo/` copies the contents
+  of `foo`; without the slashes you get `dst/foo/foo`.
+- **`{term}`** opens a terminal so you can watch the transfer, and its hold
+  option keeps it open afterwards to read the result. The option differs per
+  terminal: xterm's is `-hold`, most others take `--hold`. To use your
+  `$TERMINAL`, write `${{TERMINAL:-xterm}}` (the `{{` is a literal brace, see
+  [Variables](#variables)), with a hold option it understands.
+- **The `test -n` guard** stops an empty `path` from turning Uninstall into
+  `rm -rf ~/.wine/drive_c/games/`. The zenity dialog needs a mouse or keyboard.
+- **Verify files** lists the files that differ from the server or are missing
+  locally, by checksum. It reads every file on both ends, so it's slow on big
+  games. Run Install / update to fix what it finds.
+- **Update installed** only updates folders you already have; Pull everything
+  installs every game on the server.
+- **No `-z` on a LAN:** game files are mostly compressed already, so
+  compression costs CPU and gains little. Use `rsync -avzP` over the internet.
+- **No `--delete` by default:** it would make an update remove files the server
+  doesn't have, but plenty of games keep their config and saves in their own
+  folder, and those would go too.
+
+### Syncing saves
+
+Pull a game's saves before it starts and push them after it exits by chaining
+commands in `exec`. Use `;`, so the game still starts when the server is
+unreachable. On top of the config above:
+
+```toml
+[vars]
+saves_remote = "user@192.168.0.100:/home/user/data/saves"
+sync_saves = "rsync -a --update"
+
+[[game]]
+name = "FlatOut 2"
+exec = "{sync_saves} {saves_remote}/{path}/ {saves}/; wine FlatOut2.exe; {sync_saves} {saves}/ {saves_remote}/{path}/"
+vars = { path = "FlatOut2", saves = "Savegame" }   # where the game keeps its saves
+```
+
+- This runs without a terminal, so it needs ssh key auth.
+- `--update` never overwrites a newer file, so playing on two machines doesn't
+  lose the newest save. It can't merge two sets of changes, though; for that,
+  [Syncthing](https://syncthing.net/) on the saves folder is the better tool.
+- The sync time counts toward playtime.
+- `saves` is relative to the game's `workdir`, or a full path. Quote it if it
+  has spaces, which Wine's user folders often do.
 
 ## Command line
 
@@ -621,6 +933,7 @@ Options:
   -c, --config <FILE>  Read this config file instead of the default locations
   -f, --fullscreen     Start fullscreen
   -s, --search <TEXT>  Start with TEXT in the search bar (t:tag, g:genre filter)
+      --filter <NAME>  Start on the top bar's filter with this title
   -h, --help           Show this help
 
 Commands that run without opening the window (use one):
@@ -629,6 +942,7 @@ Commands that run without opening the window (use one):
       --show <GAME>    Print how GAME will run (exec, workdir, env, menu)
       --check          Check the whole config, hidden games included
       --igdb <NAME>    Search IGDB for NAME and print the JSON it returns
+      --igdb-matches   Print which IGDB game each game's year and genres come from
 ```
 
 - `--config` replaces the default lookup rather than going first. The file has
@@ -636,7 +950,7 @@ Commands that run without opening the window (use one):
   config to a path you gave it. F5 reloads the same file. `--config=FILE` works
   too, and a leading `~` is expanded.
 - `--fullscreen` does the same as `fullscreen = true` and wins over `start_maximized`.
-- The five commands (`--launch`, `--list`, `--show`, `--check`, `--igdb`) run
+- The six commands (`--launch`, `--list`, `--show`, `--check`, `--igdb`, `--igdb-matches`) run
   without a window, don't take the single-instance lock, and never write an
   example config: if there's no config they just say so. Use only one at a time, with
   `--config` if you like. They exit with 0 on success and 1 on failure.
@@ -660,6 +974,12 @@ Commands that run without opening the window (use one):
   warnings about a drive that isn't mounted are normal.
 - `--search` fills in the search bar and applies it right away, for example
   `rsgl -s "t:coop"`. Esc clears it like any other search.
+- `--filter NAME` starts on the top bar's [filter](#top-bar) with that title
+  instead of its `default`, for example `rsgl --filter NES` for a couch
+  shortcut. It finds the title like `--launch` finds a game, so `--filter nes`
+  works too. A title that isn't there (or a top bar without a filter) shows as
+  an error in the window, which then starts on the default. It goes with
+  `--search`: `rsgl --filter NES -s mario`. The commands above ignore it.
 
 ## Controls
 
@@ -669,6 +989,7 @@ Commands that run without opening the window (use one):
 | Tab                     | Take the search's [autocomplete](#top-bar) suggestion, if it's on                |
 | Arrow keys              | Move the selection                                                               |
 | PageUp/Down             | Move the selection a screen up or down                                           |
+| Ctrl+PageUp/Down        | Switch the top bar's [filter](#top-bar)                                          |
 | Enter / click           | Launch the selected game and close rsgl                                          |
 | Mouse over a card       | Select it (only when the mouse moves, so it doesn't fight the keyboard)          |
 | Mouse wheel             | Scroll the grid                                                                  |
@@ -699,10 +1020,12 @@ reload = []               # F5 does nothing now
 | `right`     | `Right`     | Move right                                                   |
 | `page_up`   | `PageUp`    | Move a screen up                                             |
 | `page_down` | `PageDown`  | Move a screen down                                           |
-| `launch`    | `Enter`     | Launch the selected game, run the highlighted menu entry, or use the top bar's button, menu, toggle or sort |
+| `launch`    | `Enter`     | Launch the selected game, run the highlighted menu entry, or use the top bar's button, menu, toggle, sort or filter |
 | `menu`      | `Shift+F10` | Open the selected game's right-click menu                    |
 | `back`      | `Escape`    | Close the menu, else leave the top bar, else clear the search, else quit |
 | `reload`    | `F5`        | Reload the config                                            |
+| `prev_filter` | `Ctrl+PageUp` | Switch the top bar's [filter](#top-bar) to the previous one |
+| `next_filter` | `Ctrl+PageDown` | Switch it to the next one                                |
 
 - Keys use egui's names: `Enter`, `Escape` (or `Esc`), `Tab`, `Home`, `End`,
   `PageUp`, `F1`-`F35`, `Up`/`Down`/`Left`/`Right`, letters, digits, and
@@ -735,19 +1058,21 @@ reload = []
 | `down`      | `DPadDown`, `LeftStickDown`   |
 | `left`      | `DPadLeft`, `LeftStickLeft`   |
 | `right`     | `DPadRight`, `LeftStickRight` |
-| `page_up`   | `LB`                          |
-| `page_down` | `RB`                          |
+| `page_up`   | `LT`                          |
+| `page_down` | `RT`                          |
 | `launch`    | `A`                           |
 | `menu`      | `Menu`                        |
 | `back`      | `B`                           |
 | `reload`    | `View`                        |
+| `prev_filter` | `LB`                        |
+| `next_filter` | `RB`                        |
 
 - Buttons are named after the Xbox layout and matched by position, so `A` is
   the bottom face button on any pad (Cross on a PlayStation pad): `A`, `B`,
   `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `View`, `Menu`, `Guide`, `LS`, `RS` (stick
   clicks), `DPadUp`/`Down`/`Left`/`Right`, and
   `LeftStickUp`/`Down`/`Left`/`Right` for tilting the left stick.
-- Holding a direction or `LB`/`RB` repeats it; other buttons don't.
+- Holding a direction or `LT`/`RT` repeats it; other buttons don't.
 - rsgl ignores the gamepad while its window isn't focused, so a tool started
   from the menu can be used with the pad without rsgl reacting too.
 
@@ -760,6 +1085,7 @@ Downloaded and generated files live under `~/.cache/rsgl` (`%LOCALAPPDATA%\rsgl`
 - `backgrounds/` — blurred backgrounds, regenerated automatically when `blur` changes
 - `igdb_token.toml` — the IGDB access token, readable only by you; delete it to force a new one
 - `igdb_meta.toml` — release years and genres from IGDB, by game name; delete a game's entry to look it up again
+- `hasheous.toml` — what [Hasheous](#hasheous) identified each ROM as, by file path; delete an entry to look it up again
 
 The slug is the game name lowercased, with every non-alphanumeric character
 replaced by `_` (so "Hollow Knight: Silksong" becomes `hollow_knight__silksong`).
@@ -771,3 +1097,20 @@ on the next start.
 Older versions saved images to `~/.local/share/game-covers` and
 `~/.local/share/game-heroes`. Those folders are still checked, so existing
 downloads keep working.
+
+### Portable setup
+
+`[paths]` moves the cache and the playtime file. A relative path is taken from
+the config file's folder, not the folder rsgl was started from, so the program,
+its config and everything it saves can share one folder (a USB stick, say):
+
+```toml
+[paths]
+cache = "./cache"             # default ~/.cache/rsgl
+playtime = "./playtime.toml"  # default ~/.local/share/rsgl/playtime.toml
+```
+
+Name the config `rsgl.toml` and put it next to the executable, and rsgl picks
+it up on its own, so double-clicking `rsgl.exe` is enough. A config anywhere
+else works with `rsgl -c path/to/rsgl.toml`. `~` works too. A change takes
+effect on F5, but nothing is moved over from the old place.
