@@ -1,11 +1,12 @@
 use crate::{
     api_hasheous, api_igdb, api_steamgriddb,
+    art::Art,
     config::{self, Game, MenuAction, MenuEntry, Settings},
     gamepad::Pad,
     keys::{Action, Keymap, Press},
     launch, playtime,
     search::{genres, Query},
-    spawn,
+    spawn, start_launch,
     status::{self, Part, Status},
     topbar::{Complete, Filter, SortBy, Target, Topbar, Widget, WidgetId},
     Launched,
@@ -64,6 +65,7 @@ pub fn run(
     error: Option<String>,
     fullscreen: bool,
     search: String,
+    installed: bool,
 ) -> eframe::Result<Option<Launched>> {
     let Settings { games, ui: cfg, api, playtime: pt_cfg, keyboard, gamepad, status, topbar, library, unidentified_roms } =
         settings;
@@ -90,7 +92,6 @@ pub fn run(
         options,
         Box::new(move |cc| {
             apply_theme(&cc.egui_ctx);
-            egui_extras::install_image_loaders(&cc.egui_ctx);
             let rx = fetch(&cc.egui_ctx, &games, key, cfg.blur);
             let meta = fetch_meta(&cc.egui_ctx, &games, status.uses_igdb || topbar.uses_igdb, igdb);
             let roms = identify(&cc.egui_ctx, hasheous, unidentified_roms);
@@ -99,6 +100,7 @@ pub fn run(
                 error,
                 query: search.clone(),
                 prev_query: search,
+                installed,
                 selected: 0,
                 selected_game: None,
                 prev_sort: topbar.sort(),
@@ -106,6 +108,7 @@ pub fn run(
                 page_rows: 1,
                 card_w: cfg.card_width.clamp(80.0, 400.0),
                 controls: Controls { keys: keyboard, pad: Pad::start(&cc.egui_ctx, gamepad) },
+                art: Art::new(&cc.egui_ctx),
                 rx,
                 meta,
                 roms,
@@ -131,10 +134,9 @@ pub fn run(
     Ok(out.take())
 }
 
-/// Starts downloading and blurring art for `games` in the background.
-/// The updates refer to games by their index in `games`.
-fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) -> mpsc::Receiver<api_steamgriddb::Update> {
-    let jobs: Vec<api_steamgriddb::Job> = games
+/// The art-fetcher jobs for `games`, indexed by their position in `games`.
+pub fn art_jobs(games: &[Game]) -> Vec<api_steamgriddb::Job> {
+    games
         .iter()
         .enumerate()
         .map(|(i, g)| api_steamgriddb::Job {
@@ -146,27 +148,27 @@ fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) ->
             hero_id: g.hero_id,
             search: g.art_search().map(str::to_string),
         })
-        .collect();
-    let ctx = ctx.clone();
-    api_steamgriddb::spawn_fetcher(jobs, key, blur.clamp(0.0, 50.0), move || ctx.request_repaint())
+        .collect()
 }
 
-/// Starts looking up the IGDB metadata of games that don't have it yet. With
-/// credentials that's every game, so `g:` can search all their genres; without,
-/// only the ones that show it (see `Game::needs_meta`), so the fetcher says why
-/// they stay blank. `bars_use_igdb`: the status or top bar shows some of it.
-fn fetch_meta(
-    ctx: &egui::Context,
-    games: &[Game],
-    bars_use_igdb: bool,
-    credentials: Option<(String, String)>,
-) -> mpsc::Receiver<(usize, api_igdb::Meta)> {
-    let jobs = games
+/// Starts downloading and blurring art for `games` in the background.
+/// The updates refer to games by their index in `games`.
+fn fetch(ctx: &egui::Context, games: &[Game], key: Option<String>, blur: f32) -> mpsc::Receiver<api_steamgriddb::Update> {
+    let ctx = ctx.clone();
+    api_steamgriddb::spawn_fetcher(art_jobs(games), key, blur.clamp(0.0, 50.0), move || ctx.request_repaint())
+}
+
+/// The IGDB lookup jobs for `games` that don't have metadata yet. With credentials
+/// that's every game without metadata, so `g:` can search all their genres; without,
+/// only the ones that show it (see `Game::needs_meta`), so the fetcher says why they
+/// stay blank. `bars_use_igdb`: the status or top bar shows some of it.
+pub fn meta_jobs(games: &[Game], bars_use_igdb: bool, has_credentials: bool) -> Vec<api_igdb::Job> {
+    games
         .iter()
         .enumerate()
-        .filter(|(_, g)| match credentials {
-            Some(_) => g.meta.is_none(),
-            None => g.needs_meta(bars_use_igdb),
+        .filter(|(_, g)| match has_credentials {
+            true => g.meta.is_none(),
+            false => g.needs_meta(bars_use_igdb),
         })
         .map(|(index, g)| api_igdb::Job {
             index,
@@ -174,7 +176,17 @@ fn fetch_meta(
             igdb_id: g.igdb_id,
             platform: g.igdb_platform.clone(),
         })
-        .collect();
+        .collect()
+}
+
+/// Starts looking up the IGDB metadata of games that don't have it yet.
+fn fetch_meta(
+    ctx: &egui::Context,
+    games: &[Game],
+    bars_use_igdb: bool,
+    credentials: Option<(String, String)>,
+) -> mpsc::Receiver<(usize, api_igdb::Meta)> {
+    let jobs = meta_jobs(games, bars_use_igdb, credentials.is_some());
     let ctx = ctx.clone();
     api_igdb::spawn_meta_fetcher(jobs, credentials, move || ctx.request_repaint())
 }
@@ -550,7 +562,7 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 /// Draws one game card and returns its click/hover response.
-fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> egui::Response {
+fn card(ui: &mut egui::Ui, art: &mut Art, g: &Game, w: f32, selected: bool, scroll: bool) -> egui::Response {
     let cover_h = w * 1.5;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, cover_h + LABEL_H), egui::Sense::click());
 
@@ -569,12 +581,18 @@ fn card(ui: &mut egui::Ui, g: &Game, w: f32, selected: bool, scroll: bool) -> eg
     // a game that isn't installed is drawn dimmed
     let dim = if g.installed() { 1.0 } else { NOT_INSTALLED_DIM };
 
-    match g.cover.as_ref().filter(|c| c.exists()) {
-        Some(path) => {
-            egui::Image::new(format!("file://{}", path.display()))
+    // asked for at its lifted size, so lifting doesn't decode it again
+    let px = egui::Rect::from_min_size(rect.min, vec2(w, cover_h)).expand(LIFT).size() * ui.ctx().pixels_per_point();
+    match g.cover.as_ref().filter(|c| c.exists()).map(|p| art.get(p, px)) {
+        Some(Some(texture)) => {
+            egui::Image::new((texture.id(), cover.size()))
                 .corner_radius(radius)
                 .tint(Color32::WHITE.gamma_multiply(dim))
                 .paint_at(ui, cover);
+        }
+        // still decoding
+        Some(None) => {
+            ui.painter().rect_filled(cover, radius, SURFACE.gamma_multiply(dim));
         }
         None => {
             // colored placeholder derived from the name
@@ -620,6 +638,7 @@ struct App {
     error: Option<String>,
     query: String,
     prev_query: String,
+    installed: bool, // only show installed games (--installed)
     selected: usize, // position within the filtered list
     selected_game: Option<usize>, // the game at `selected` last frame, so it stays selected when the order changes under it
     prev_sort: SortBy,
@@ -627,6 +646,7 @@ struct App {
     page_rows: usize, // rows that fit in the grid, for PageUp/PageDown
     card_w: f32,
     controls: Controls,
+    art: Art, // cover and background textures
     rx: mpsc::Receiver<api_steamgriddb::Update>,
     meta: mpsc::Receiver<(usize, api_igdb::Meta)>, // IGDB metadata, by game index
     roms: mpsc::Receiver<bool>, // whether each ROM Hasheous was asked about was identified; closed when it's done
@@ -717,13 +737,13 @@ impl Source {
 /// `g:` genre word being typed, the first in alphabetical order that's longer. Only
 /// from the games the rest of the search and the top bar's `filter` show, so taking
 /// it never empties the grid.
-fn suggestion(query: &str, games: &[Game], complete: &[Complete], filter: Option<&Query>) -> Option<String> {
+fn suggestion(query: &str, games: &[Game], complete: &[Complete], filter: Option<&Query>, installed: bool) -> Option<String> {
     if complete.is_empty() || query.ends_with(char::is_whitespace) {
         return None;
     }
     let word = query.split_whitespace().next_back()?;
     let rest = Query::parse(&query[..query.len() - word.len()]);
-    let shown = games.iter().filter(|g| filter.is_none_or(|f| f.matches_game(g)) && rest.matches_game(g));
+    let shown = games.iter().filter(|g| (!installed || g.installed()) && filter.is_none_or(|f| f.matches_game(g)) && rest.matches_game(g));
     let word = word.to_lowercase();
     let (typed, candidates): (String, Vec<&str>) = match (word.strip_prefix("t:"), word.strip_prefix("g:")) {
         (Some(tag), _) if complete.contains(&Complete::Tags) => {
@@ -761,7 +781,11 @@ impl App {
         let query = Query::parse(&self.query);
         let filter = self.topbar.filter().map(|f| &f.query);
         let mut shown: Vec<usize> = (0..self.games.len())
-            .filter(|&i| filter.is_none_or(|f| f.matches_game(&self.games[i])) && query.matches_game(&self.games[i]))
+            .filter(|&i| {
+                (!self.installed || self.games[i].installed())
+                    && filter.is_none_or(|f| f.matches_game(&self.games[i]))
+                    && query.matches_game(&self.games[i])
+            })
             .collect();
         sort(&mut shown, &self.games, self.playtime.as_ref(), self.topbar.sort());
         shown
@@ -867,25 +891,49 @@ impl App {
                     open_folder(dir);
                 }
             }
-            MenuAction::Exec(cmd) => match spawn(cmd, e.workdir.as_deref(), &e.env.with(&toggles)) {
-                Ok(child) if e.launch => {
-                    let Source::Game(gi) = source else { unreachable!("only a game's entries launch it") };
-                    let g = &self.games[gi];
-                    *self.launched.borrow_mut() =
-                        Some(Launched { name: g.name.clone(), pgid: child.id(), playtime: g.playtime });
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            MenuAction::Exec(cmds) if e.launch => {
+                let Source::Game(gi) = source else { unreachable!("only a game's entries launch it") };
+                let g = &self.games[gi];
+                match start_launch(&g.name, cmds, e.workdir.as_deref(), &e.env, &toggles, g.playtime) {
+                    Ok(launched) => {
+                        *self.launched.borrow_mut() = Some(launched);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(err) => self.fail(format!("Couldn't run \"{}\": {err}", e.title)),
                 }
-                // rsgl stays open, so reap the tool when it exits instead of leaving a zombie.
-                // Repaint then too: an install or uninstall tool changes which games are dimmed
-                Ok(mut child) => {
-                    let ctx = ctx.clone();
-                    thread::spawn(move || {
-                        let _ = child.wait();
-                        ctx.request_repaint();
-                    });
+            }
+            // rsgl stays open, so reap each step when it exits instead of leaving a zombie.
+            // Repaint then too: an install or uninstall tool changes which games are dimmed
+            MenuAction::Exec(cmds) => {
+                let env: Vec<_> = e
+                    .env
+                    .with(&toggles)
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+                    .collect();
+                let pairs: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+                match spawn(&cmds[0], e.workdir.as_deref(), &pairs) {
+                    Ok(mut child) => {
+                        let rest = cmds[1..].to_vec();
+                        let workdir = e.workdir.clone();
+                        let ctx = ctx.clone();
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                            let pairs: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+                            for cmd in &rest {
+                                match spawn(cmd, workdir.as_deref(), &pairs) {
+                                    Ok(mut c) => {
+                                        let _ = c.wait();
+                                    }
+                                    Err(e) => eprintln!("rsgl: {e}"),
+                                }
+                            }
+                            ctx.request_repaint();
+                        });
+                    }
+                    Err(err) => self.fail(format!("Couldn't run \"{}\": {err}", e.title)),
                 }
-                Err(err) => self.fail(format!("Couldn't run \"{}\": {err}", e.title)),
-            },
+            }
         }
     }
 
@@ -966,33 +1014,35 @@ impl App {
             // keep the old one fully visible under the new one, unless there's no new one
             let old = if self.bg.is_some() { 1.0 } else { 1.0 - t };
             if let Some(p) = &self.prev_bg {
-                paint_cover(ctx, &painter, screen, p, old);
+                paint_cover(&mut self.art, &painter, screen, p, old);
             }
             ctx.request_repaint();
         }
         if let Some(p) = &self.bg {
-            paint_cover(ctx, &painter, screen, p, t);
+            paint_cover(&mut self.art, &painter, screen, p, t);
         }
     }
 }
 
 /// Draws the image at `path` scaled to cover `screen` (cropping the overflow),
 /// dimmed and at the given opacity. Draws nothing until the texture is loaded.
-fn paint_cover(ctx: &egui::Context, painter: &egui::Painter, screen: egui::Rect, path: &Path, alpha: f32) {
-    let uri = format!("file://{}", path.display());
-    let Ok(egui::load::TexturePoll::Ready { texture }) =
-        ctx.try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::SizeHint::default())
-    else {
+fn paint_cover(art: &mut Art, painter: &egui::Painter, screen: egui::Rect, path: &Path, alpha: f32) {
+    let ctx = painter.ctx();
+    // the monitor rather than the window, so resizing the window doesn't decode it again
+    let fill = ctx.input(|i| i.viewport().monitor_size).unwrap_or(screen.size()).max(screen.size());
+    let Some(texture) = art.get(path, fill * ctx.pixels_per_point()) else {
         return;
     };
-    let scale = (screen.width() / texture.size.x).max(screen.height() / texture.size.y);
-    let rect = egui::Rect::from_center_size(screen.center(), texture.size * scale);
+    let size = texture.size_vec2();
+    let scale = (screen.width() / size.x).max(screen.height() / size.y);
+    let rect = egui::Rect::from_center_size(screen.center(), size * scale);
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    painter.image(texture.id, rect, uv, Color32::from_gray(BG_DIM).gamma_multiply(alpha));
+    painter.image(texture.id(), rect, uv, Color32::from_gray(BG_DIM).gamma_multiply(alpha));
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.art.begin_frame(ctx);
         // with_maximized alone is ignored by some X11 window managers (xfwm4),
         // because winit asks before the window is shown. eframe shows it after
         // the first frame, so asking again from here works there too.
@@ -1209,7 +1259,7 @@ impl eframe::App for App {
             }
             hint.push(')');
             let filter = self.topbar.filter().map(|f| &f.query);
-            let ghost = suggestion(&self.query, &self.games, self.topbar.autocomplete(), filter);
+            let ghost = suggestion(&self.query, &self.games, self.topbar.autocomplete(), filter, self.installed);
             let (query, focus) = (&mut self.query, self.focus);
             // no fill, the background shows through. No bottom margin, the grid's own spacing follows
             tools = egui::TopBottomPanel::top("topbar")
@@ -1305,7 +1355,7 @@ impl eframe::App for App {
                                     ui.add_space(GAP);
                                 }
                                 let n = r * cols + c;
-                                let resp = card(ui, &self.games[i], w, highlight && n == selected, moved);
+                                let resp = card(ui, &mut self.art, &self.games[i], w, highlight && n == selected, moved);
                                 if n == selected {
                                     selected_rect = Some(resp.rect);
                                 }
@@ -1338,8 +1388,8 @@ impl eframe::App for App {
         if let Some(i) = to_launch {
             let g = &self.games[i];
             match launch(g, &toggles) {
-                Ok(pgid) => {
-                    *self.launched.borrow_mut() = Some(Launched { name: g.name.clone(), pgid, playtime: g.playtime });
+                Ok(launched) => {
+                    *self.launched.borrow_mut() = Some(launched);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 // stay open, so the game can be fixed in the config and retried after F5
@@ -1464,7 +1514,7 @@ mod tests {
         let cnc = games.iter_mut().find(|g| g.name.starts_with("Command")).unwrap();
         cnc.set_meta(api_igdb::Meta { genres: genres.into(), ..Default::default() });
         let all = [Complete::Names, Complete::Tags, Complete::Genres];
-        let s = |q: &str| suggestion(q, &games, &all, None);
+        let s = |q: &str| suggestion(q, &games, &all, None, false);
 
         assert_eq!(s("qu").as_deref(), Some("ake"), "the first in alphabetical order");
         assert_eq!(s("QUAKE").as_deref(), Some(" III Arena"), "longer than what's typed, any case");
@@ -1480,13 +1530,13 @@ mod tests {
         assert_eq!(s("").as_deref(), None);
         assert_eq!(s("zork").as_deref(), None);
 
-        assert_eq!(suggestion("qu", &games, &[Complete::Tags], None), None, "names are off");
-        assert_eq!(suggestion("t:co", &games, &[Complete::Names], None), None, "tags are off, and t:co isn't a name");
-        assert_eq!(suggestion("qu", &games, &[], None), None);
+        assert_eq!(suggestion("qu", &games, &[Complete::Tags], None, false), None, "names are off");
+        assert_eq!(suggestion("t:co", &games, &[Complete::Names], None, false), None, "tags are off, and t:co isn't a name");
+        assert_eq!(suggestion("qu", &games, &[], None, false), None);
 
         let lan = Query::parse("t:lan");
-        assert_eq!(suggestion("qu", &games, &all, Some(&lan)).as_deref(), Some("ake III Arena"), "only the filter's games");
-        assert_eq!(suggestion("t:", &games, &all, Some(&lan)).as_deref(), Some("fps"));
+        assert_eq!(suggestion("qu", &games, &all, Some(&lan), false).as_deref(), Some("ake III Arena"), "only the filter's games");
+        assert_eq!(suggestion("t:", &games, &all, Some(&lan), false).as_deref(), Some("fps"));
     }
 
     #[test]

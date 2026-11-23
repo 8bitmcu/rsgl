@@ -67,7 +67,7 @@ impl Token {
 #[serde(default)]
 pub struct Meta {
     /// IGDB's name for the game, behind a ROM's `{igdb_name}`. `None` if IGDB doesn't
-    /// know the game, or it was cached before names were kept.
+    /// know the game.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub year: Option<i32>,

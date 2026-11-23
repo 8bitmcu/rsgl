@@ -70,8 +70,20 @@ fn group_alive(pgid: i32) -> bool {
 /// Waits up to `wait`, then reports whether the game has finished.
 #[cfg(unix)]
 fn wait_finished(pgid: u32, wait: Duration) -> bool {
-    thread::sleep(wait);
-    !group_alive(pgid as i32)
+    let pgid = pgid as i32;
+    let deadline = Instant::now() + wait;
+    let mut step = Duration::from_millis(5);
+    loop {
+        if !group_alive(pgid) {
+            return true;
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        thread::sleep(step.min(rem));
+        step = (step * 2).min(Duration::from_millis(250));
+    }
 }
 
 #[cfg(windows)]
@@ -109,25 +121,43 @@ pub fn wait(pgid: u32) {
     while !wait_finished(pgid, POLL) {}
 }
 
-/// Waits until the game has finished (on Unix, until its process group is empty),
-/// saving the time played to `file` every `checkpoint` (if non-zero) and once more at the end.
-pub fn track(pgid: u32, file: &Path, name: &str, checkpoint: Duration) {
-    // Instant doesn't advance while the machine is suspended, so sleep isn't counted
-    let mut last = Instant::now();
-    loop {
-        let alive = !wait_finished(pgid, POLL);
-        let now = Instant::now();
-        if !alive || (!checkpoint.is_zero() && now - last >= checkpoint) {
-            // only move `last` forward by whole seconds, so no time is lost to rounding
-            let played = Duration::from_secs((now - last).as_secs());
-            if let Err(e) = add(file, name, played) {
-                eprintln!("rsgl: saving playtime: {e}");
+/// Tracks one launch across its `exec` steps, saving the time played to `file`
+/// every `checkpoint` (if non-zero) and once more at the end.
+pub struct Session<'a> {
+    file: &'a Path,
+    name: &'a str,
+    checkpoint: Duration,
+    last: Instant,
+}
+
+impl<'a> Session<'a> {
+    pub fn new(file: &'a Path, name: &'a str, checkpoint: Duration) -> Self {
+        // Instant doesn't advance while the machine is suspended, so sleep isn't counted
+        Self { file, name, checkpoint, last: Instant::now() }
+    }
+
+    /// Waits until step `pgid` has finished (on Unix, until its process group is empty),
+    /// saving at each `checkpoint` along the way.
+    pub fn wait(&mut self, pgid: u32) {
+        while !wait_finished(pgid, POLL) {
+            let now = Instant::now();
+            if !self.checkpoint.is_zero() && now - self.last >= self.checkpoint {
+                self.save(now);
             }
-            last += played;
         }
-        if !alive {
-            break;
+    }
+
+    fn save(&mut self, now: Instant) {
+        // only move `last` forward by whole seconds, so no time is lost to rounding
+        let played = Duration::from_secs((now - self.last).as_secs());
+        if let Err(e) = add(self.file, self.name, played) {
+            eprintln!("rsgl: saving playtime: {e}");
         }
+        self.last += played;
+    }
+
+    pub fn finish(mut self) {
+        self.save(Instant::now());
     }
 }
 

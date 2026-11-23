@@ -583,7 +583,7 @@ mod tests {
         )
         .unwrap();
         let Widget::Button(b) = &t.left[0] else { panic!("a button") };
-        assert_eq!(b.action, config::MenuAction::Exec("foot -e htop".into()));
+        assert_eq!(b.action, config::MenuAction::Exec(vec!["foot -e htop".into()]));
         assert_eq!((b.env.all["A"].as_str(), b.env.all["WINEDEBUG"].as_str()), ("foot", "-all"));
         assert!(!b.launch && b.workdir.is_none());
         let Widget::Menu { title, entries } = &t.right[1] else { panic!("a menu") };

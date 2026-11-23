@@ -4,6 +4,7 @@
 mod api_hasheous;
 mod api_igdb;
 mod api_steamgriddb;
+mod art;
 mod blur;
 mod config;
 mod gamepad;
@@ -13,6 +14,7 @@ mod search;
 mod status;
 mod topbar;
 mod ui;
+mod vdf;
 
 use config::{Game, Settings, Toggles};
 use std::{
@@ -103,10 +105,32 @@ fn spawn(exec: &str, workdir: Option<&Path>, env: &[(&str, Option<&str>)]) -> Re
     cmd.spawn().map_err(|e| e.to_string())
 }
 
-/// Starts the game, with the top bar's `toggles`, and returns its pid (on Unix also its
-/// process group id).
-fn launch(g: &Game, toggles: &Toggles) -> Result<u32, String> {
-    spawn(&g.exec, g.workdir.as_deref(), &g.env.with(toggles)).map(|c| c.id())
+/// Starts the first command of `exec` and returns a `Launched` with its pid (on Unix also
+/// its process group id) and any remaining commands for `Tracker`.
+pub fn start_launch(
+    name: &str,
+    exec: &[String],
+    workdir: Option<&Path>,
+    env: &config::Env,
+    toggles: &Toggles,
+    playtime: bool,
+) -> Result<Launched, String> {
+    let env_changes = env.with(toggles);
+    let child = spawn(&exec[0], workdir, &env_changes)?;
+    let rest = exec[1..].to_vec();
+    let (workdir, env) = match rest.is_empty() {
+        true => (None, Vec::new()),
+        false => (
+            workdir.map(Path::to_path_buf),
+            env_changes.into_iter().map(|(k, v)| (k.to_string(), v.map(str::to_string))).collect(),
+        ),
+    };
+    Ok(Launched { name: name.to_string(), pgid: child.id(), exec: rest, workdir, env, playtime })
+}
+
+/// Starts the game, with the top bar's `toggles`.
+fn launch(g: &Game, toggles: &Toggles) -> Result<Launched, String> {
+    start_launch(&g.name, &g.exec, g.workdir.as_deref(), &g.env, toggles, g.playtime)
 }
 
 /// Takes an exclusive lock on `path`, held until the returned file is dropped
@@ -128,12 +152,16 @@ Options:
   -f, --fullscreen     Start fullscreen
   -s, --search <TEXT>  Start with TEXT in the search bar (t:tag, g:genre filter)
       --filter <NAME>  Start on the top bar's filter with this title
+      --installed      Only include installed games
   -h, --help           Show this help
+  -V, --version        Show the version
 
 Commands that run without opening the window (use one):
       --launch <GAME>  Start GAME
+      --random         Start a random game
       --list           Print the names of all games
       --show <GAME>    Print how GAME will run (exec, workdir, env, menu)
+      --fetch          Download missing art and metadata into the cache
       --check          Check the whole config, hidden games included
       --igdb <NAME>    Search IGDB for NAME and print the JSON it returns
       --igdb-matches   Print which IGDB game each game's year and genres come from
@@ -143,8 +171,10 @@ Commands that run without opening the window (use one):
 #[derive(Debug, PartialEq)]
 enum Action {
     Launch(String),
+    Random,
     List,
     Show(String),
+    Fetch,
     Check,
     Igdb(String),
     IgdbMatches,
@@ -155,17 +185,28 @@ struct Cli {
     config: Option<PathBuf>,
     search: String,
     filter: Option<String>,
+    installed: bool,
     action: Option<Action>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
-    let mut cli = Cli { fullscreen: false, config: None, search: String::new(), filter: None, action: None };
+    let mut cli = Cli {
+        fullscreen: false,
+        config: None,
+        search: String::new(),
+        filter: None,
+        installed: false,
+        action: None,
+    };
     let set_action = |cli: &mut Cli, action: Action| match cli.action {
         None => {
             cli.action = Some(action);
             Ok(())
         }
-        Some(_) => Err("use only one of --launch, --list, --show, --check, --igdb and --igdb-matches".to_string()),
+        Some(_) => Err(
+            "use only one of --launch, --random, --list, --show, --fetch, --check, --igdb and --igdb-matches"
+                .to_string(),
+        ),
     };
     while let Some(arg) = args.next() {
         // `--flag=value` is the same as `--flag value`
@@ -175,11 +216,18 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
         };
         match flag {
             "-f" | "--fullscreen" if inline.is_none() => cli.fullscreen = true,
+            "--installed" if inline.is_none() => cli.installed = true,
             "-h" | "--help" if inline.is_none() => {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
+            "-V" | "--version" if inline.is_none() => {
+                println!("rsgl {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--random" if inline.is_none() => set_action(&mut cli, Action::Random)?,
             "--list" if inline.is_none() => set_action(&mut cli, Action::List)?,
+            "--fetch" if inline.is_none() => set_action(&mut cli, Action::Fetch)?,
             "--check" if inline.is_none() => set_action(&mut cli, Action::Check)?,
             "--igdb-matches" if inline.is_none() => set_action(&mut cli, Action::IgdbMatches)?,
             "-c" | "--config" | "-s" | "--search" | "--filter" | "--show" | "--launch" | "--igdb" => {
@@ -205,16 +253,24 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Cli, String> {
 pub struct Launched {
     pub name: String,
     pub pgid: u32,
+    /// The remaining `exec` commands to run after `pgid` exits, with their `workdir` and `env`.
+    pub exec: Vec<String>,
+    pub workdir: Option<PathBuf>,
+    pub env: Vec<(String, Option<String>)>,
     /// The game's own `playtime` setting.
     pub playtime: bool,
 }
 
 /// The job of the background copy of rsgl that stays behind after a launch: wait
-/// for the game to exit, saving its playtime along the way if `playtime` is set,
-/// then open the launcher again with the `reopen` arguments if those are set.
+/// for each `exec` step to exit and start the next, saving playtime along the way
+/// if `playtime` is set, then open the launcher again with the `reopen` arguments
+/// if those are set.
 #[derive(Debug, PartialEq)]
 struct Tracker {
     pgid: u32,
+    exec: Vec<String>,
+    workdir: Option<PathBuf>,
+    env: Vec<(String, Option<String>)>,
     /// Game name, checkpoint interval in seconds and the playtime file. The file is
     /// passed along because the copy doesn't read the config and its [paths].
     playtime: Option<(String, u64, PathBuf)>,
@@ -222,9 +278,22 @@ struct Tracker {
 }
 
 impl Tracker {
-    /// `--track <pgid> [--playtime <checkpoint secs> <file> <name>] [--reopen <args>...]`
+    /// `--track <pgid> [--workdir <dir>] [--env <k> <v> | --unset <k>]... [--exec <cmd>]...
+    /// [--playtime <checkpoint secs> <file> <name>] [--reopen <args>...]`
     fn to_args(&self) -> Vec<String> {
         let mut args = vec!["--track".to_string(), self.pgid.to_string()];
+        if let Some(dir) = &self.workdir {
+            args.extend(["--workdir".to_string(), dir.to_string_lossy().into_owned()]);
+        }
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => args.extend(["--env".to_string(), k.clone(), v.clone()]),
+                None => args.extend(["--unset".to_string(), k.clone()]),
+            }
+        }
+        for cmd in &self.exec {
+            args.extend(["--exec".to_string(), cmd.clone()]);
+        }
         if let Some((name, secs, file)) = &self.playtime {
             // arguments are read as UTF-8 anyway (env::args)
             let file = file.to_string_lossy().into_owned();
@@ -244,6 +313,36 @@ impl Tracker {
             return None;
         }
         let pgid = pgid.parse().ok()?;
+        let mut rest = rest;
+        let workdir = match rest {
+            [f, dir, r @ ..] if f == "--workdir" => {
+                rest = r;
+                Some(PathBuf::from(dir))
+            }
+            _ => None,
+        };
+        let mut env = Vec::new();
+        loop {
+            match rest {
+                [f, k, v, r @ ..] if f == "--env" => {
+                    env.push((k.clone(), Some(v.clone())));
+                    rest = r;
+                }
+                [f, k, r @ ..] if f == "--unset" => {
+                    env.push((k.clone(), None));
+                    rest = r;
+                }
+                _ => break,
+            }
+        }
+        let mut exec = Vec::new();
+        while let [f, cmd, r @ ..] = rest {
+            if f != "--exec" {
+                break;
+            }
+            exec.push(cmd.clone());
+            rest = r;
+        }
         let (playtime, rest) = match rest {
             [f, secs, file, name, rest @ ..] if f == "--playtime" => {
                 (Some((name.clone(), secs.parse().ok()?, PathBuf::from(file))), rest)
@@ -255,13 +354,28 @@ impl Tracker {
             [f, reopen @ ..] if f == "--reopen" => Some(reopen.to_vec()),
             _ => return None,
         };
-        Some(Self { pgid, playtime, reopen })
+        Some(Self { pgid, exec, workdir, env, playtime, reopen })
     }
 
     fn run(self) {
-        match self.playtime {
-            Some((name, secs, file)) => playtime::track(self.pgid, &file, &name, Duration::from_secs(secs)),
-            None => playtime::wait(self.pgid),
+        let mut session = self
+            .playtime
+            .as_ref()
+            .map(|(name, secs, file)| playtime::Session::new(file, name, Duration::from_secs(*secs)));
+        let mut wait = |pgid| match &mut session {
+            Some(s) => s.wait(pgid),
+            None => playtime::wait(pgid),
+        };
+        wait(self.pgid);
+        let env: Vec<_> = self.env.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+        for cmd in &self.exec {
+            match spawn(cmd, self.workdir.as_deref(), &env) {
+                Ok(child) => wait(child.id()),
+                Err(e) => eprintln!("rsgl: {e}"),
+            }
+        }
+        if let Some(s) = session {
+            s.finish();
         }
         if let Some(args) = self.reopen {
             if let Err(e) = respawn(&args) {
@@ -334,8 +448,111 @@ fn respawn(args: &[String]) -> Result<(), std::io::Error> {
         .map(drop)
 }
 
+/// The games in `games` that match `-s` (`search`), `--filter` (`filter`) and `--installed`.
+fn matching<'a>(
+    games: &'a [Game],
+    search: &str,
+    filter: Option<&search::Query>,
+    installed: bool,
+) -> Vec<&'a Game> {
+    let query = search::Query::parse(search);
+    games
+        .iter()
+        .filter(|g| {
+            (!installed || g.installed())
+                && filter.is_none_or(|f| f.matches_game(g))
+                && query.matches_game(g)
+        })
+        .collect()
+}
+
+/// Picks one item at random from `items`.
+fn pick_random<'a, T>(items: &[&'a T]) -> Option<&'a T> {
+    if items.is_empty() {
+        return None;
+    }
+    use std::{
+        collections::hash_map::RandomState,
+        hash::{BuildHasher, Hasher},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let mut h = RandomState::new().build_hasher();
+    h.write_u128(nanos);
+    Some(items[(h.finish() as usize) % items.len()])
+}
+
+/// Starts `game` without a window (so no toggles: `[env]` is what they start from
+/// anyway), and keeps a `Tracker` running if playtime is on or there are more `exec`
+/// steps to run.
+fn launch_headless(game: &Game, pt: &config::PlaytimeCfg) -> Result<(), String> {
+    let l = launch(game, &Toggles::new()).map_err(|e| format!("couldn't start {}: {e}", game.name))?;
+    let tracker = Tracker {
+        pgid: l.pgid,
+        exec: l.exec,
+        workdir: l.workdir,
+        env: l.env,
+        playtime: (pt.enabled && l.playtime)
+            .then(|| (l.name, pt.checkpoint_minutes * 60, config::playtime_file())),
+        reopen: None,
+    };
+    if !tracker.exec.is_empty() || tracker.playtime.is_some() {
+        tracker.start();
+    }
+    Ok(())
+}
+
+/// `--fetch`: identifies ROMs on Hasheous (if enabled), looks up missing IGDB metadata,
+/// then downloads missing covers/heroes from SteamGridDB and blurs backgrounds.
+fn run_fetch(
+    mut settings: Settings,
+    search: &str,
+    filter: Option<&str>,
+    installed: bool,
+) -> Result<(), String> {
+    if !settings.unidentified_roms.is_empty() {
+        let rx = api_hasheous::spawn_identifier(
+            settings.api.hasheous_api(),
+            settings.unidentified_roms,
+            || {},
+        );
+        let mut identified_any = false;
+        for identified in rx {
+            identified_any |= identified;
+        }
+        if identified_any {
+            settings = config::load_existing()?;
+        }
+    }
+    if let Some(title) = filter {
+        settings.topbar.pick_filter(title)?;
+    }
+    let active_filter = filter.and_then(|_| settings.topbar.filter().map(|f| &f.query));
+    if !search.is_empty() || active_filter.is_some() || installed {
+        let query = search::Query::parse(search);
+        settings.games.retain(|g| {
+            (!installed || g.installed())
+                && active_filter.is_none_or(|f| f.matches_game(g))
+                && query.matches_game(g)
+        });
+    }
+
+    let bars_use_igdb = settings.status.uses_igdb || settings.topbar.uses_igdb;
+    let igdb = settings.api.igdb_credentials();
+    let meta_jobs = ui::meta_jobs(&settings.games, bars_use_igdb, igdb.is_some());
+    for (i, meta) in api_igdb::spawn_meta_fetcher(meta_jobs, igdb, || {}) {
+        settings.games[i].set_meta(meta);
+    }
+
+    let art_jobs = ui::art_jobs(&settings.games);
+    let key = settings.api.steamgriddb_key();
+    let blur = settings.ui.blur.clamp(0.0, 50.0);
+    for _ in api_steamgriddb::spawn_fetcher(art_jobs, key, blur, || {}) {}
+    Ok(())
+}
+
 /// Runs a command-line action and returns the exit code.
-fn run_action(action: Action) -> i32 {
+fn run_action(action: Action, search: &str, filter: Option<&str>, installed: bool) -> i32 {
     let fail = |msg: String| {
         eprintln!("rsgl: {msg}");
         1
@@ -343,10 +560,25 @@ fn run_action(action: Action) -> i32 {
     if action == Action::Check {
         return run_check();
     }
-    let Settings { games, playtime: pt, api, .. } = match config::load_existing() {
+    let mut settings = match config::load_existing() {
         Ok(loaded) => loaded,
         Err(e) => return fail(e),
     };
+    if action == Action::Fetch {
+        return match run_fetch(settings, search, filter, installed) {
+            Ok(()) => 0,
+            Err(e) => fail(e),
+        };
+    }
+    if matches!(action, Action::List | Action::Random) {
+        if let Some(title) = filter {
+            if let Err(e) = settings.topbar.pick_filter(title) {
+                return fail(e);
+            }
+        }
+    }
+    let active_filter = filter.and_then(|_| settings.topbar.filter().map(|f| &f.query));
+    let Settings { games, playtime: pt, api, .. } = &settings;
 
     let igdb = || match api.igdb_credentials() {
         Some((id, secret)) => api_igdb::Client::new(id, secret).map_err(|e| format!("IGDB sign-in failed: {e}")),
@@ -355,7 +587,7 @@ fn run_action(action: Action) -> i32 {
     };
 
     match action {
-        Action::Check => unreachable!("handled above"),
+        Action::Check | Action::Fetch => unreachable!("handled above"),
         Action::Igdb(name) => {
             let mut client = match igdb() {
                 Ok(c) => c,
@@ -375,7 +607,7 @@ fn run_action(action: Action) -> i32 {
                 Err(e) => return fail(e),
             };
             let mut unsure = 0;
-            for g in &games {
+            for g in games {
                 match client.find(&g.name, g.igdb_id, g.igdb_platform.as_deref()) {
                     Ok(hit) => {
                         let (sure, line) = igdb_match(&g.name, g.igdb_id, hit.as_ref());
@@ -395,35 +627,38 @@ fn run_action(action: Action) -> i32 {
             0
         }
         Action::List => {
-            for g in &games {
+            for g in matching(games, search, active_filter, installed) {
                 println!("{}", g.name);
             }
             0
         }
-        Action::Show(query) => match config::find(&games, &query) {
+        Action::Show(query) => match config::find(games, &query) {
             Ok(g) => {
                 print!("{}", config::describe(g));
                 0
             }
             Err(e) => fail(e),
         },
-        Action::Launch(query) => {
-            let game = match config::find(&games, &query) {
-                Ok(g) => g,
-                Err(e) => return fail(e),
+        Action::Launch(query) => match config::find(games, &query) {
+            Ok(game) => match launch_headless(game, pt) {
+                Ok(()) => 0,
+                Err(e) => fail(e),
+            },
+            Err(e) => fail(e),
+        },
+        Action::Random => {
+            let pool = matching(games, search, active_filter, installed);
+            let Some(game) = pick_random(&pool) else {
+                let msg = if games.is_empty() {
+                    "no games in the config (hidden games aren't loaded)"
+                } else {
+                    "no game matches"
+                };
+                return fail(msg.into());
             };
-            // no window, so no toggles: [env] is what they start from anyway
-            match launch(game, &Toggles::new()) {
-                Ok(pgid) => {
-                    // like a launch from the window: with playtime on, a small copy of rsgl
-                    // stays behind to time the game (on Unix this replaces this process)
-                    if pt.enabled && game.playtime {
-                        let playtime = Some((game.name.clone(), pt.checkpoint_minutes * 60, config::playtime_file()));
-                        Tracker { pgid, playtime, reopen: None }.start();
-                    }
-                    0
-                }
-                Err(e) => fail(format!("couldn't start {}: {e}", game.name)),
+            match launch_headless(game, pt) {
+                Ok(()) => 0,
+                Err(e) => fail(e),
             }
         }
     }
@@ -475,6 +710,13 @@ fn run_check() -> i32 {
 fn main() -> eframe::Result {
     #[cfg(windows)]
     attach_parent_console();
+    // glibc raises its mmap threshold to the size of each big block freed, after which
+    // decoded images come from the heap and stay with the process once freed: RSS grew
+    // by hundreds of MB that way. Pinned, they're mapped and go back to the OS on free.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 4 << 20);
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     // internal: the copy that stays behind after a launch, see `Tracker`
@@ -490,7 +732,7 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
-    let Cli { fullscreen, config: config_path, search, filter, action } = cli;
+    let Cli { fullscreen, config: config_path, search, filter, installed, action } = cli;
     if let Some(path) = config_path {
         if !path.is_file() {
             eprintln!("rsgl: {}: config file not found", path.display());
@@ -501,7 +743,7 @@ fn main() -> eframe::Result {
 
     // no window, no single-instance lock, and no example config written
     if let Some(action) = action {
-        std::process::exit(run_action(action));
+        std::process::exit(run_action(action, &search, filter.as_deref(), installed));
     }
 
     let (mut settings, mut error) = match config::load() {
@@ -532,16 +774,19 @@ fn main() -> eframe::Result {
     let checkpoint = settings.playtime.checkpoint_minutes * 60;
     let reopen = settings.ui.reopen_after_game;
     let fullscreen = fullscreen || settings.ui.fullscreen;
-    let launched = ui::run(settings, error, fullscreen, search)?;
+    let launched = ui::run(settings, error, fullscreen, search, installed)?;
 
     if let Some(l) = launched {
         let tracker = Tracker {
             pgid: l.pgid,
+            exec: l.exec,
+            workdir: l.workdir,
+            env: l.env,
             playtime: (track && l.playtime).then(|| (l.name, checkpoint, config::playtime_file())),
             // the same arguments, so the reopened window uses the same config, -f, -s and --filter
             reopen: reopen.then_some(args),
         };
-        if tracker.playtime.is_some() || tracker.reopen.is_some() {
+        if !tracker.exec.is_empty() || tracker.playtime.is_some() || tracker.reopen.is_some() {
             tracker.start();
         }
     }
@@ -566,6 +811,8 @@ mod tests {
     #[test]
     fn actions_and_their_arguments() {
         assert_eq!(parse(&["--list"]).unwrap().action, Some(Action::List));
+        assert_eq!(parse(&["--random"]).unwrap().action, Some(Action::Random));
+        assert_eq!(parse(&["--fetch"]).unwrap().action, Some(Action::Fetch));
         assert_eq!(parse(&["--check"]).unwrap().action, Some(Action::Check));
         assert_eq!(parse(&["--show", "Quake"]).unwrap().action, Some(Action::Show("Quake".into())));
         assert_eq!(parse(&["--launch=Left 4 Dead 2"]).unwrap().action, Some(Action::Launch("Left 4 Dead 2".into())));
@@ -603,14 +850,18 @@ mod tests {
     #[test]
     fn tracker_arguments_round_trip() {
         let strings = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let bare = || Tracker { pgid: 42, exec: vec![], workdir: None, env: vec![], playtime: None, reopen: None };
         for t in [
-            Tracker { pgid: 42, playtime: None, reopen: None },
-            Tracker { pgid: 42, playtime: Some(("".into(), 300, "/p/playtime.toml".into())), reopen: None },
-            Tracker { pgid: 42, playtime: None, reopen: Some(vec![]) },
+            bare(),
+            Tracker { playtime: Some(("".into(), 300, "/p/playtime.toml".into())), ..bare() },
+            Tracker { reopen: Some(vec![]), ..bare() },
             Tracker {
-                pgid: 42,
+                exec: strings(&["--playtime", "--reopen"]),
+                workdir: Some("--exec".into()),
+                env: vec![("--exec".into(), Some("--reopen".into())), ("UNSET".into(), None)],
                 playtime: Some(("--reopen".into(), 0, "--reopen".into())),
                 reopen: Some(strings(&["-c", "x", "-f"])),
+                ..bare()
             },
         ] {
             assert_eq!(Tracker::from_args(&t.to_args()), Some(t));
@@ -621,13 +872,85 @@ mod tests {
         assert_eq!(Tracker::from_args(&strings(&["-f"])), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tracker_runs_exec_steps_in_order_and_continues_past_a_failing_step() {
+        let dir = std::env::temp_dir().join(format!("rsgl-tracker-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("steps.txt");
+        let pt_file = dir.join("playtime.toml");
+        let mut env = config::Env::default();
+        env.all.insert("STEP_TAG".into(), "ok".into());
+
+        let steps = vec![
+            "printf '1:%s\\n' \"$STEP_TAG\" >> steps.txt".to_string(),
+            "sed -i 's/x/y/' missing.cfg".to_string(),
+            "printf '3\\n' >> steps.txt".to_string(),
+            "printf '4\\n' >> steps.txt".to_string(),
+        ];
+        let l = start_launch("Delta Force", &steps, Some(&dir), &env, &Toggles::new(), true).unwrap();
+        Tracker {
+            pgid: l.pgid,
+            exec: l.exec,
+            workdir: l.workdir,
+            env: l.env,
+            playtime: Some((l.name, 0, pt_file.clone())),
+            reopen: None,
+        }
+        .run();
+
+        assert_eq!(fs::read_to_string(&log).unwrap(), "1:ok\n3\n4\n");
+        let pt: playtime::Playtime = toml::from_str(&fs::read_to_string(&pt_file).unwrap()).unwrap();
+        assert!(pt["Delta Force"].last_played > 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn options_still_work_alongside_actions() {
-        let cli = parse(&["-f", "-s", "t:coop", "--filter=NES", "--config=/x.toml", "--list"]).unwrap();
+        let cli = parse(&["-f", "--installed", "-s", "t:coop", "--filter=NES", "--config=/x.toml", "--list"]).unwrap();
         assert!(cli.fullscreen);
+        assert!(cli.installed);
         assert_eq!(cli.search, "t:coop");
         assert_eq!(cli.filter.as_deref(), Some("NES"));
         assert_eq!(cli.config, Some(PathBuf::from("/x.toml")));
         assert_eq!(cli.action, Some(Action::List));
+    }
+
+    #[test]
+    fn matching_filters_by_search_topbar_filter_and_installed() {
+        let dir = std::env::temp_dir();
+        let games = config::parse_games(&format!(
+            r#"
+[[game]]
+name = "Quake"
+exec = "a"
+workdir = {dir:?}
+tags = ["fps", "coop"]
+
+[[game]]
+name = "Quake III Arena"
+exec = "b"
+workdir = "/rsgl-test/missing/dir"
+tags = ["fps", "lan"]
+
+[[game]]
+name = "Left 4 Dead 2"
+exec = "c"
+tags = ["coop"]
+"#
+        ))
+        .unwrap();
+        let names = |search: &str, filter: Option<&str>, installed: bool| -> Vec<&str> {
+            let f = filter.map(search::Query::parse);
+            matching(&games, search, f.as_ref(), installed).into_iter().map(|g| g.name.as_str()).collect()
+        };
+        assert_eq!(names("", None, false), ["Left 4 Dead 2", "Quake", "Quake III Arena"]);
+        assert_eq!(names("", None, true), ["Left 4 Dead 2", "Quake"], "Quake III's workdir is missing");
+        assert_eq!(names("t:coop", None, false), ["Left 4 Dead 2", "Quake"]);
+        assert_eq!(names("quake", Some("t:fps"), false), ["Quake", "Quake III Arena"]);
+        assert_eq!(names("quake", Some("t:fps"), true), ["Quake"]);
+        assert!(pick_random(&matching(&games, "zork", None, false)).is_none());
+        let fps = search::Query::parse("t:fps");
+        assert_eq!(pick_random(&matching(&games, "quake", Some(&fps), true)).unwrap().name, "Quake");
     }
 }

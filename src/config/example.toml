@@ -1,0 +1,225 @@
+# rsgl config
+
+# Extra config files to merge in (relative to this file's folder). Settings in
+# this file win over included ones; [[game]], [[roms]] and [[right_click]] add up.
+# include = ["games.toml"]
+
+[ui]
+card_width = 170
+# background blur strength, 0 turns it off
+blur = 8
+# only allow one launcher window at a time
+single_instance = true
+# open the window maximized
+start_maximized = false
+# open the window fullscreen, like -f
+fullscreen = false
+# open the launcher again when a game launched from it exits
+reopen_after_game = false
+
+[playtime]
+enabled = true
+# save the current session every N minutes, 0 only saves when the game exits
+checkpoint_minutes = 5
+
+# Where the cache (covers, heroes, backgrounds, IGDB data) and the playtime file
+# go. A relative path is taken from this file's folder, so rsgl, its config and
+# its data can live together in one portable folder.
+# [paths]
+# cache = "./cache"                            # default ~/.cache/rsgl
+# playtime = "./playtime.toml"                 # default ~/.local/share/rsgl/playtime.toml
+
+[api]
+# steamgriddb_key = "your-key-here"
+# IGDB metadata, from a Twitch app (dev.twitch.tv/console); fills in {year} and {genres}
+# igdb_client_id = "your-client-id"
+# igdb_client_secret = "your-client-secret"
+# identify [[roms]] files by their contents on hasheous.org, for proper names and
+# IGDB and SteamGridDB ids; reads every ROM once to hash it
+# hasheous = false
+# hasheous_url = "http://nas:5000"             # a self-hosted Hasheous, default hasheous.org
+
+# The status bar under the grid. Each part is a text with variables: the game's
+# {title}, {name}, {year}, {genres}, {playtime}, {last_played}, {not_installed}
+# and {tags}, the {shown} and {total} game counts, and your own [vars]. A part
+# whose variables are all blank is left out, separator and all. This is the default:
+# [status]
+# separator = " · "
+# left = [
+#   { text = "{title}", bold = true },
+#   { text = "{playtime} · last played {last_played}" },
+#   { text = "{not_installed}" },
+#   { text = "{tags}" },
+# ]
+# right = [{ text = "{shown} games" }]
+# {env:NAME} works in parts too: the value the selected game would launch with.
+
+# The bar above the grid: widgets on the left, in the center and on the right.
+# A label is a text like a [status] part; the search bar's placeholder replaces
+# the key hint, and its autocomplete suggests names, tags and genres (Tab takes it). Buttons and menu entries run a tool, with [vars] and [env] but
+# not a game's own. A toggle sets an [env] variable to on or off (no off: unset)
+# for whatever is launched next, or with var, one of the [vars] (no off: blank).
+# A sort orders the grid. A filter narrows it to a search on top of what's typed,
+# switched with its < > arrows, Ctrl+PageUp/PageDown or LB/RB, and "" shows every
+# game. Leaving out center puts the search there. This is the default:
+# [topbar]
+# left = []
+# center = [{ type = "search" }]
+# right = []
+# For example:
+# left = [{ type = "label", text = "MangoHud {env:MANGOHUD}", bold = true }]
+# center = [{ type = "search", placeholder = "Find something to play…", autocomplete = ["names", "tags", "genres"] }]
+# right = [
+#   { type = "button", title = "Steam", exec = "steam -bigpicture" },
+#   { type = "sort", options = ["name", "last_played", "playtime", "year"], default = "last_played" },
+#   { type = "filter", options = [
+#     { title = "All", filter = "" },
+#     { title = "PC", filter = "t:pc" },
+#     { title = "SNES", filter = "t:snes" },
+#   ] },
+#   { type = "toggle", title = "MangoHud", env = "MANGOHUD", on = "1", off = "0" },
+#   { type = "menu", title = "Tools", entries = [{ title = "Lutris", exec = "lutris" }] },
+# ]
+
+# Keys for each action. An action you leave out keeps its default (shown here);
+# an empty list unbinds it. Modifiers are Ctrl, Alt and Shift. Letters, digits,
+# punctuation, Space, Backspace and Delete need Ctrl or Alt, since the search box uses them.
+# [keyboard]
+# up = ["Up"]                                   # from the top row, into the top bar's buttons
+# down = ["Down"]
+# left = ["Left"]
+# right = ["Right"]
+# page_up = ["PageUp"]
+# page_down = ["PageDown"]
+# launch = ["Enter"]                           # also runs the highlighted menu entry
+# menu = ["Shift+F10"]                         # open the selected game's right-click menu
+# back = ["Escape"]                            # close the menu, leave the top bar, clear the search, then quit
+# reload = ["F5"]
+# prev_filter = ["Ctrl+PageUp"]                # switch the top bar's filter
+# next_filter = ["Ctrl+PageDown"]
+
+# Gamepad buttons for each action, same rules as [keyboard]. Buttons are named
+# after the Xbox layout and matched by position (A is the bottom face button on
+# any pad): A B X Y LB RB LT RT View Menu Guide LS RS DPadUp DPadDown DPadLeft
+# DPadRight, plus LeftStickUp/Down/Left/Right for tilting the left stick.
+# [gamepad]
+# up = ["DPadUp", "LeftStickUp"]
+# down = ["DPadDown", "LeftStickDown"]
+# left = ["DPadLeft", "LeftStickLeft"]
+# right = ["DPadRight", "LeftStickRight"]
+# page_up = ["LT"]
+# page_down = ["RT"]
+# launch = ["A"]
+# menu = ["Menu"]
+# back = ["B"]
+# reload = ["View"]
+# prev_filter = ["LB"]
+# next_filter = ["RB"]
+
+# Variables: {name} is replaced in name, exec, workdir, cover and env values (and
+# in menu entries). A game's own `vars` override these, and a variable can use
+# others, e.g. gs = "gamescope -w {w} -h {h} -f --". Write {{ for a literal brace.
+# [vars]
+# games = "~/games"
+
+# Environment variables for every game and menu entry. A game's own `env` wins.
+# [env]
+# WINEDEBUG = "-all"
+
+# Templates: keys shared by the games that list one in `template`. A game uses
+# [templates.default] first (ROMs don't), then its own templates left to right,
+# then its own keys; each wins over the ones before. exec, workdir, cover and
+# playtime are replaced, env and vars merge key by key, tags and right_click add
+# up. Variables are filled in after, so {dir} is each game's own.
+# [templates.default]
+# workdir = "{games}/{dir}"                    # a game's workdir = "" means none
+#
+# [templates.wine]
+# exec = 'wine "{exe}"'
+# env = { WINEPREFIX = "~/.wine/{dir}" }
+# tags = ["pc"]
+#
+# [[templates.wine.right_click]]
+# title = "winecfg"
+# exec = "winecfg"
+
+# Right-click menu entries shown for every game, before the game's own.
+# `action = "open_folder"` opens the workdir; or give an exec to run.
+# [[right_click]]
+# title = "Open game folder"
+# action = "open_folder"
+#
+# Entries also get the game's {name}, {grid} and {hero} (the full paths of its
+# cover and hero, blank if none) and {workdir}. An entry's own vars win over the
+# game's, and {exec} is the game's exec as written, so with
+# exec = "{gs} wine game.exe" this runs plain "wine game.exe".
+# [[right_click]]
+# title = "Launch without gamescope"
+# exec = "{exec}"
+# vars = { gs = "" }
+# launch = true
+#
+# An entry only for [[game]] entries goes in [[templates.default.right_click]];
+# one only for ROMs, in a template the [[roms]] list, so it can use {rom}.
+# [[templates.snes.right_click]]
+# title = "Delete ROM"
+# exec = '''zenity --question --text="Delete {name}?" && rm "{rom}"'''
+
+# Every file in a folder as a game, named after the file without (USA), [!] and
+# such. {rom} is the file's full path; workdir defaults to path.
+# [templates.snes]
+# exec = 'retroarch -L ~/.config/retroarch/cores/snes9x_libretro.so "{rom}"'
+#
+# [[roms]]
+# path = "~/roms/snes"
+# extensions = ["sfc", "smc", "zip"]
+# template = "snes"                           # or exec = '...' right here
+# tags = ["snes"]
+# name = "{igdb_name} (SNES)"                 # show IGDB's name instead of the file's
+# igdb_platform = "snes"                      # only match IGDB games on this platform (its slug)
+# files."F-Zero (USA).sfc" = { igdb_id = 1234 } # one file's ids, by file name: igdb_id,
+#                                             # steamgriddb_id, grid_id, hero_id
+# files."bios.sfc" = { hidden = true }        # a file that isn't a game
+
+# Every installed Steam game as a game, with {appid} and {installdir}. Steam is
+# found on its own; path = "..." if it's somewhere else.
+# [steam]
+# tags = ["steam"]
+# games.570 = { hidden = true }               # one game's settings, by app id: any
+# games.620 = { tags = ["coop"] }             # [[game]] key but steam_appid
+
+# Every game installed through Lutris as a game, with {id}, {slug}, {runner},
+# {platform} and {directory}. Keys like [steam]'s; games.<slug> for one game.
+# [lutris]
+# tags = ["lutris"]
+# games.the-witcher-3 = { tags = ["rpg"] }
+
+[[game]]
+name = "Example Game"                          # "Example Game {year}" adds the release year from IGDB
+exec = "~/games/example/start.sh"              # or ["before", "game", "after"], run one by one
+# template = "wine"                            # or ["wine", "coop"], see [templates]
+# cover = "~/.cache/rsgl/covers/example.png"
+# workdir = "~/games/example"
+# env = { SOME_VAR = "value" }
+# playtime = false                             # don't track this game
+# hidden = true                                # keep the entry but leave it out of the grid
+# tags = ["coop", "lan", "fps"]                # filter with t:coop in the search bar
+# steam_appid = 367520                         # pick covers by Steam app id instead of by name
+# steamgriddb_id = 1234                        # or by SteamGridDB game id
+# grid_id = 664940                             # use this SteamGridDB grid as the cover
+# hero_id = 15208                              # and this hero for the background
+# igdb_id = 707                                # get {year} and {genres} from this IGDB game instead of by name
+# vars = { dir = "example" }                   # this game's variables, see [vars]
+
+# Menu entries must come after the game's other keys, since every key below a
+# [[game.right_click]] header belongs to that entry.
+# [[game.right_click]]
+# title = "Play (windowed)"
+# exec = "./start.sh -windowed"
+# launch = true                                # close rsgl and track playtime, like a normal launch
+#
+# [[game.right_click]]
+# title = "Edit settings"
+# exec = "xdg-open ~/.config/example/settings.ini"
+# workdir = "~"                                # optional, defaults to the game's workdir
+# env = { SOME_VAR = "value" }                 # optional, added to the game's env
